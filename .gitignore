@@ -1,0 +1,36 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+
+# Environment variables
+.env
+.env.local
+.env.*.local
+
+# Storage
+storage/
+
+# Source maps
+*.js.map
+
+# Crawlee local storage
+storage/
+.crawlee/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+npm-debug.log*
+
+# Test files
+test.csv
+test.xlsx
+
+# IDE
+.vscode/
+.idea/

@@ -1,0 +1,97 @@
+import ExcelJS from 'exceljs';
+import { prisma } from '../lib/prisma';
+import { StorageService } from './storage';
+
+interface ExportRow {
+  domain: string;
+  name: string;
+  description: string;
+  location: string;
+  emails: string;
+  phones: string;
+  services: string;
+  socialLinks: string;
+  completionScore: number;
+  crawlStatus: string;
+}
+
+async function fetchRows(batchId: string, tenantId: string): Promise<ExportRow[]> {
+  const companies = await prisma.company.findMany({
+    where: {
+      tenantCompanies: { some: { tenantId, sourceBatchId: batchId } },
+    },
+    include: { profile: true },
+  });
+
+  return companies.map((c) => ({
+    domain: c.domain,
+    name: c.profile?.name ?? c.name ?? '',
+    description: c.profile?.description ?? '',
+    location: c.profile?.location ?? '',
+    emails: Array.isArray(c.profile?.emails) ? (c.profile.emails as string[]).join(', ') : '',
+    phones: Array.isArray(c.profile?.phones) ? (c.profile.phones as string[]).join(', ') : '',
+    services: Array.isArray(c.profile?.services) ? (c.profile.services as string[]).join(', ') : '',
+    socialLinks: c.profile?.socialLinks ? JSON.stringify(c.profile.socialLinks) : '',
+    completionScore: c.profile?.completionScore ?? 0,
+    crawlStatus: c.crawlStatus,
+  }));
+}
+
+export const ExportService = {
+  async exportBatch(
+    batchId: string,
+    tenantId: string,
+    format: 'csv' | 'xlsx'
+  ): Promise<string> {
+    const rows = await fetchRows(batchId, tenantId);
+    const filename = `export-${batchId}-${Date.now()}.${format}`;
+    const subdir = `exports/${tenantId}`;
+
+    if (format === 'xlsx') {
+      const workbook = new ExcelJS.Workbook();
+      const sheet = workbook.addWorksheet('Companies');
+
+      sheet.columns = [
+        { header: 'Domain', key: 'domain', width: 30 },
+        { header: 'Name', key: 'name', width: 30 },
+        { header: 'Description', key: 'description', width: 50 },
+        { header: 'Location', key: 'location', width: 25 },
+        { header: 'Emails', key: 'emails', width: 40 },
+        { header: 'Phones', key: 'phones', width: 30 },
+        { header: 'Services', key: 'services', width: 50 },
+        { header: 'Social Links', key: 'socialLinks', width: 50 },
+        { header: 'Completion Score', key: 'completionScore', width: 18 },
+        { header: 'Crawl Status', key: 'crawlStatus', width: 15 },
+      ];
+
+      sheet.addRows(rows);
+
+      const buffer = await workbook.xlsx.writeBuffer();
+      return StorageService.save(subdir, filename, Buffer.from(buffer));
+    } else {
+      // CSV
+      const headers = [
+        'domain', 'name', 'description', 'location',
+        'emails', 'phones', 'services', 'socialLinks',
+        'completionScore', 'crawlStatus',
+      ];
+
+      const escape = (v: string | number) => {
+        const s = String(v);
+        if (s.includes(',') || s.includes('"') || s.includes('\n')) {
+          return `"${s.replace(/"/g, '""')}"`;
+        }
+        return s;
+      };
+
+      const lines = [
+        headers.join(','),
+        ...rows.map((r) =>
+          headers.map((h) => escape((r as unknown as Record<string, string | number>)[h] ?? '')).join(',')
+        ),
+      ];
+
+      return StorageService.save(subdir, filename, lines.join('\n'));
+    }
+  },
+};

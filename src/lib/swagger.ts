@@ -1,0 +1,75 @@
+import swaggerJsdoc from 'swagger-jsdoc';
+
+const options: swaggerJsdoc.Options = {
+  definition: {
+    openapi: '3.0.0',
+    info: {
+      title: 'Companies Intelligence API',
+      version: '1.0.0',
+      description: 'B2B Data Enrichment Engine — upload company domains, crawl websites, extract structured profiles.',
+    },
+    servers: [{ url: 'http://localhost:3001' }],
+    components: {
+      securitySchemes: {
+        bearerAuth: {
+          type: 'http',
+          scheme: 'bearer',
+          bearerFormat: 'JWT',
+          description: 'JWT token with tenantId claim. Generate one via: node -e "const jwt=require(\'jsonwebtoken\');console.log(jwt.sign({sub:\'user-1\',tenantId:\'test-tenant-id\'},process.env.JWT_SECRET,{expiresIn:\'7d\'}))"',
+        },
+      },
+      schemas: {
+        Batch: {
+          type: 'object',
+          properties: {
+            id: { type: 'string', format: 'uuid' },
+            tenantId: { type: 'string' },
+            fileName: { type: 'string' },
+            status: { type: 'string', enum: ['PENDING', 'PROCESSING', 'COMPLETED', 'FAILED'] },
+            totalCompanies: { type: 'integer' },
+            processedCompanies: { type: 'integer' },
+            completionPercentage: { type: 'number' },
+            createdAt: { type: 'string', format: 'date-time' },
+          },
+        },
+        Company: {
+          type: 'object',
+          properties: {
+            id: { type: 'string', format: 'uuid' },
+            domain: { type: 'string' },
+            baseUrl: { type: 'string' },
+            name: { type: 'string', nullable: true },
+            crawlStatus: { type: 'string', enum: ['PENDING', 'CRAWLING', 'COMPLETED', 'FAILED'] },
+            lastCrawledAt: { type: 'string', format: 'date-time', nullable: true },
+            profile: { $ref: '#/components/schemas/CompanyProfile', nullable: true },
+          },
+        },
+        CompanyProfile: {
+          type: 'object',
+          properties: {
+            name: { type: 'string', nullable: true },
+            description: { type: 'string', nullable: true },
+            location: { type: 'string', nullable: true },
+            emails: { type: 'array', items: { type: 'string' } },
+            phones: { type: 'array', items: { type: 'string' } },
+            services: { type: 'array', items: { type: 'string' } },
+            team: { type: 'array', items: { type: 'string' } },
+            history: { type: 'string', nullable: true },
+            socialLinks: { type: 'object' },
+            completionScore: { type: 'number' },
+          },
+        },
+        Error: {
+          type: 'object',
+          properties: {
+            error: { type: 'string' },
+          },
+        },
+      },
+    },
+    security: [{ bearerAuth: [] }],
+  },
+  apis: ['./src/api/routes/*.ts'],
+};
+
+export const swaggerSpec = swaggerJsdoc(options);

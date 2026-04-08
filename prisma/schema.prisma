@@ -1,0 +1,118 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model Tenant {
+  id           String        @id @default(uuid())
+  name         String
+  weeklyQuota  Int           @default(1000)
+  weeklyUsage  Int           @default(0)
+  usageResetAt DateTime      @default(now())
+  createdAt    DateTime      @default(now())
+
+  crawlBatches    CrawlBatch[]
+  tenantCompanies TenantCompany[]
+  users           User[]
+}
+
+model User {
+  id           String   @id @default(uuid())
+  email        String   @unique
+  passwordHash String
+  tenantId     String
+  createdAt    DateTime @default(now())
+
+  tenant Tenant @relation(fields: [tenantId], references: [id])
+}
+
+model Company {
+  id            String    @id @default(uuid())
+  domain        String    @unique
+  baseUrl       String
+  name          String?
+  lastCrawledAt DateTime?
+  crawlStatus   CrawlStatus @default(PENDING)
+  createdAt     DateTime  @default(now())
+
+  tenantCompanies   TenantCompany[]
+  rawProfiles       RawCompanyProfile[]
+  profile           CompanyProfile?
+}
+
+model TenantCompany {
+  tenantId      String
+  companyId     String
+  sourceBatchId String?
+  createdAt     DateTime @default(now())
+
+  tenant      Tenant     @relation(fields: [tenantId], references: [id])
+  company     Company    @relation(fields: [companyId], references: [id])
+  sourceBatch CrawlBatch? @relation(fields: [sourceBatchId], references: [id])
+
+  @@id([tenantId, companyId])
+}
+
+model CrawlBatch {
+  id                   String      @id @default(uuid())
+  tenantId             String
+  filePath             String?
+  fileName             String?
+  status               BatchStatus @default(PENDING)
+  totalCompanies       Int         @default(0)
+  processedCompanies   Int         @default(0)
+  completionPercentage Float       @default(0)
+  exportPath           String?
+  createdAt            DateTime    @default(now())
+  updatedAt            DateTime    @updatedAt
+
+  tenant          Tenant          @relation(fields: [tenantId], references: [id])
+  tenantCompanies TenantCompany[]
+}
+
+model RawCompanyProfile {
+  id          String   @id @default(uuid())
+  companyId   String
+  baseUrl     String
+  specificUrl String
+  data        Json
+  createdAt   DateTime @default(now())
+
+  company Company @relation(fields: [companyId], references: [id])
+}
+
+model CompanyProfile {
+  id              String   @id @default(uuid())
+  companyId       String   @unique
+  name            String?
+  description     String?
+  location        String?
+  emails          Json     @default("[]")
+  phones          Json     @default("[]")
+  services        Json     @default("[]")
+  team            Json     @default("[]")
+  history         String?
+  socialLinks     Json     @default("{}")
+  completionScore Float    @default(0)
+  updatedAt       DateTime @updatedAt
+
+  company Company @relation(fields: [companyId], references: [id])
+}
+
+enum BatchStatus {
+  PENDING
+  PROCESSING
+  COMPLETED
+  FAILED
+}
+
+enum CrawlStatus {
+  PENDING
+  CRAWLING
+  COMPLETED
+  FAILED
+}
