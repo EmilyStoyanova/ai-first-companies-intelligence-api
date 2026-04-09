@@ -31,12 +31,14 @@ app.use('/api/batches', batchesRouter);
 app.use('/api/companies', companiesRouter);
 app.use('/api/exports', exportsRouter);
 
-app.use((_req, res) => {
+app.use((req, res) => {
   res.status(404).json({ error: 'Not found' });
 });
 
 app.listen(PORT, () => {
   console.log(`[server] listening on http://localhost:${PORT}`);
+  console.log(`[server] Frontend  → http://localhost:3000`);
+  console.log(`[server] API docs  → http://localhost:${PORT}/docs`);
 });
 
 export default app;

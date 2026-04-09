@@ -2,6 +2,21 @@ import ExcelJS from 'exceljs';
 import { prisma } from '../lib/prisma';
 import { StorageService } from './storage';
 
+interface TeamMember { name: string; position?: string; email?: string; }
+
+function serializeTeam(raw: unknown): string {
+  if (!raw) return '';
+  const arr: TeamMember[] = Array.isArray(raw) ? raw as TeamMember[] : [];
+  return arr
+    .map((m) => {
+      let s = m.name;
+      if (m.position) s += ` (${m.position})`;
+      if (m.email)    s += ` <${m.email}>`;
+      return s;
+    })
+    .join('; ');
+}
+
 interface ExportRow {
   domain: string;
   name: string;
@@ -10,6 +25,7 @@ interface ExportRow {
   emails: string;
   phones: string;
   services: string;
+  team: string;
   socialLinks: string;
   completionScore: number;
   crawlStatus: string;
@@ -31,6 +47,7 @@ async function fetchRows(batchId: string, tenantId: string): Promise<ExportRow[]
     emails: Array.isArray(c.profile?.emails) ? (c.profile.emails as string[]).join(', ') : '',
     phones: Array.isArray(c.profile?.phones) ? (c.profile.phones as string[]).join(', ') : '',
     services: Array.isArray(c.profile?.services) ? (c.profile.services as string[]).join(', ') : '',
+    team: serializeTeam(c.profile?.team),
     socialLinks: c.profile?.socialLinks ? JSON.stringify(c.profile.socialLinks) : '',
     completionScore: c.profile?.completionScore ?? 0,
     crawlStatus: c.crawlStatus,
@@ -59,6 +76,7 @@ export const ExportService = {
         { header: 'Emails', key: 'emails', width: 40 },
         { header: 'Phones', key: 'phones', width: 30 },
         { header: 'Services', key: 'services', width: 50 },
+        { header: 'Team', key: 'team', width: 60 },
         { header: 'Social Links', key: 'socialLinks', width: 50 },
         { header: 'Completion Score', key: 'completionScore', width: 18 },
         { header: 'Crawl Status', key: 'crawlStatus', width: 15 },
@@ -72,7 +90,7 @@ export const ExportService = {
       // CSV
       const headers = [
         'domain', 'name', 'description', 'location',
-        'emails', 'phones', 'services', 'socialLinks',
+        'emails', 'phones', 'services', 'team', 'socialLinks',
         'completionScore', 'crawlStatus',
       ];
 

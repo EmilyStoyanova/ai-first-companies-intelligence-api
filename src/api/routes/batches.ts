@@ -52,6 +52,23 @@ function parseFile(filePath: string, ext: string): string[] {
   }
 }
 
+// GET /batches — list all batches for the authenticated tenant
+router.get('/', requireAuth, async (req: Request, res: Response): Promise<void> => {
+  const tenantId = req.user.tenantId;
+
+  try {
+    const batches = await prisma.crawlBatch.findMany({
+      where: { tenantId },
+      orderBy: { createdAt: 'desc' },
+      take: 100,
+    });
+    res.json(batches);
+  } catch (err) {
+    console.error('[batches/list]', err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
 /**
  * @openapi
  * /api/batches/upload:
@@ -431,6 +448,31 @@ router.get('/:id/download', requireAuth, async (req: Request, res: Response): Pr
     res.send(StorageService.read(exportPath));
   } catch (err) {
     console.error('[batches/:id/download]', err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// DELETE /batches/:id
+router.delete('/:id', requireAuth, async (req: Request, res: Response): Promise<void> => {
+  const id = String(req.params.id);
+  const tenantId = req.user.tenantId;
+
+  try {
+    const batch = await prisma.crawlBatch.findFirst({ where: { id, tenantId } });
+    if (!batch) {
+      res.status(404).json({ error: 'Batch not found' });
+      return;
+    }
+
+    // Unlink tenant-company associations for this batch, then delete the batch
+    await prisma.$transaction([
+      prisma.tenantCompany.deleteMany({ where: { sourceBatchId: id } }),
+      prisma.crawlBatch.delete({ where: { id } }),
+    ]);
+
+    res.status(204).send();
+  } catch (err) {
+    console.error('[batches/delete]', err);
     res.status(500).json({ error: 'Internal server error' });
   }
 });

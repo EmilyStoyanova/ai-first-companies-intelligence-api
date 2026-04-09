@@ -21,11 +21,13 @@ model Tenant {
 }
 
 model User {
-  id           String   @id @default(uuid())
-  email        String   @unique
-  passwordHash String
-  tenantId     String
-  createdAt    DateTime @default(now())
+  id                     String   @id @default(uuid())
+  email                  String   @unique
+  passwordHash           String
+  tenantId               String
+  emailVerified          Boolean  @default(false)
+  emailVerificationToken String?  @unique
+  createdAt              DateTime @default(now())
 
   tenant Tenant @relation(fields: [tenantId], references: [id])
 }

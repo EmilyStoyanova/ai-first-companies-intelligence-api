@@ -1,7 +1,9 @@
 import { Router, Request, Response } from 'express';
 import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
+import { v4 as uuidv4 } from 'uuid';
 import { prisma } from '../../lib/prisma';
+import { sendConfirmationEmail } from '../../lib/email';
 
 const router = Router();
 
@@ -23,25 +25,14 @@ const router = Router();
  *               email:
  *                 type: string
  *                 format: email
- *                 example: user@company.com
  *               password:
  *                 type: string
  *                 minLength: 8
- *                 example: mysecretpassword
  *               tenantName:
  *                 type: string
- *                 example: My Company
  *     responses:
  *       201:
  *         description: User registered, JWT returned
- *         content:
- *           application/json:
- *             schema:
- *               type: object
- *               properties:
- *                 token: { type: string }
- *                 tenantId: { type: string }
- *                 userId: { type: string }
  *       400:
  *         description: Validation error or email already taken
  */
@@ -65,16 +56,19 @@ router.post('/register', async (req: Request, res: Response): Promise<void> => {
   }
 
   const passwordHash = await bcrypt.hash(password, 10);
+  const emailVerificationToken = uuidv4();
 
-  // Create tenant + user in a transaction
   const { user, tenant } = await prisma.$transaction(async (tx) => {
-    const tenant = await tx.tenant.create({
-      data: { name: tenantName },
-    });
+    const tenant = await tx.tenant.create({ data: { name: tenantName } });
     const user = await tx.user.create({
-      data: { email, passwordHash, tenantId: tenant.id },
+      data: { email, passwordHash, tenantId: tenant.id, emailVerificationToken },
     });
     return { user, tenant };
+  });
+
+  // Send confirmation email (non-blocking — don't fail registration if email fails)
+  sendConfirmationEmail(email, emailVerificationToken).catch((err) => {
+    console.error('[auth/register] Failed to send confirmation email:', err.message);
   });
 
   const token = jwt.sign(
@@ -83,7 +77,10 @@ router.post('/register', async (req: Request, res: Response): Promise<void> => {
     { expiresIn: '7d' }
   );
 
-  res.status(201).json({ token, tenantId: tenant.id, userId: user.id });
+  res.status(201).json({
+    token,
+    user: { id: user.id, email: user.email, emailVerified: user.emailVerified, tenantId: tenant.id },
+  });
 });
 
 /**
@@ -103,22 +100,11 @@ router.post('/register', async (req: Request, res: Response): Promise<void> => {
  *             properties:
  *               email:
  *                 type: string
- *                 format: email
- *                 example: user@company.com
  *               password:
  *                 type: string
- *                 example: mysecretpassword
  *     responses:
  *       200:
  *         description: Login successful, JWT returned
- *         content:
- *           application/json:
- *             schema:
- *               type: object
- *               properties:
- *                 token: { type: string }
- *                 tenantId: { type: string }
- *                 userId: { type: string }
  *       401:
  *         description: Invalid credentials
  */
@@ -148,7 +134,55 @@ router.post('/login', async (req: Request, res: Response): Promise<void> => {
     { expiresIn: '7d' }
   );
 
-  res.json({ token, tenantId: user.tenantId, userId: user.id });
+  res.json({
+    token,
+    user: { id: user.id, email: user.email, emailVerified: user.emailVerified, tenantId: user.tenantId },
+  });
+});
+
+/**
+ * @openapi
+ * /api/auth/confirm-email:
+ *   get:
+ *     summary: Confirm email address via token from email link
+ *     tags: [Auth]
+ *     security: []
+ *     parameters:
+ *       - in: query
+ *         name: token
+ *         required: true
+ *         schema:
+ *           type: string
+ *     responses:
+ *       302:
+ *         description: Redirects to dashboard with result
+ */
+router.get('/confirm-email', async (req: Request, res: Response): Promise<void> => {
+  const { token } = req.query;
+
+  if (!token || typeof token !== 'string') {
+    res.redirect('http://localhost:3000/dashboard?error=invalid_token');
+    return;
+  }
+
+  try {
+    const user = await prisma.user.findFirst({ where: { emailVerificationToken: token } });
+
+    if (!user) {
+      res.redirect('http://localhost:3000/dashboard?error=invalid_token');
+      return;
+    }
+
+    await prisma.user.update({
+      where: { id: user.id },
+      data: { emailVerified: true, emailVerificationToken: null },
+    });
+
+    res.redirect('http://localhost:3000/dashboard?verified=true');
+  } catch (err) {
+    console.error('[auth/confirm-email]', err);
+    res.redirect('http://localhost:3000/dashboard?error=server_error');
+  }
 });
 
 export default router;

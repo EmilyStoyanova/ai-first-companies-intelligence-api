@@ -1,6 +1,12 @@
 import * as cheerio from 'cheerio';
 import { CrawledPage } from '../worker/crawl';
 
+export interface TeamMember {
+  name: string;
+  position?: string;
+  email?: string;
+}
+
 export interface ExtractedProfile {
   name?: string;
   description?: string;
@@ -8,7 +14,7 @@ export interface ExtractedProfile {
   emails: string[];
   phones: string[];
   services: string[];
-  team: string[];
+  team: TeamMember[];
   history?: string;
   socialLinks: Record<string, string>;
   completionScore: number;
@@ -22,6 +28,8 @@ const SOCIAL_DOMAINS: Record<string, string> = {
   'instagram.com': 'instagram',
   'youtube.com': 'youtube',
 };
+
+// ── Social links ──────────────────────────────────────────────────────────────
 
 function extractSocialLinks(pages: CrawledPage[]): Record<string, string> {
   const links: Record<string, string> = {};
@@ -44,25 +52,24 @@ function extractSocialLinks(pages: CrawledPage[]): Record<string, string> {
   return links;
 }
 
+// ── Company name ──────────────────────────────────────────────────────────────
+
 function extractCompanyName(pages: CrawledPage[]): string | undefined {
   const homepage = pages[0];
   if (!homepage?.html) return undefined;
 
   const $ = cheerio.load(homepage.html);
 
-  // Try <title>
-  const title = $('title').text().trim();
-  if (title) {
-    // Strip common suffixes like " - Home", " | Services"
-    return title.split(/[|\-–]/)[0].trim();
-  }
-
-  // Try og:site_name
   const ogSite = $('meta[property="og:site_name"]').attr('content');
   if (ogSite) return ogSite.trim();
 
+  const title = $('title').text().trim();
+  if (title) return title.split(/[|\-–]/)[0].trim();
+
   return undefined;
 }
+
+// ── Description ───────────────────────────────────────────────────────────────
 
 function extractDescription(pages: CrawledPage[]): string | undefined {
   const homepage = pages[0];
@@ -76,7 +83,6 @@ function extractDescription(pages: CrawledPage[]): string | undefined {
   const ogDesc = $('meta[property="og:description"]').attr('content');
   if (ogDesc && ogDesc.length > 20) return ogDesc.trim();
 
-  // Fall back to first substantial paragraph
   let fallback = '';
   $('p').each((_i, el) => {
     const t = $(el).text().trim();
@@ -86,57 +92,228 @@ function extractDescription(pages: CrawledPage[]): string | undefined {
   return fallback || undefined;
 }
 
-function extractLocation(pages: CrawledPage[]): string | undefined {
-  // Look for common address patterns across all pages text
-  const combined = pages.map((p) => p.text).join('\n');
+// ── Location ──────────────────────────────────────────────────────────────────
 
-  // Simple heuristic: lines containing "Address", city+zip patterns, etc.
-  const ADDRESS_RE = /\b(\d{1,5}\s+\w[\w\s,.-]{5,60}(?:Street|St|Avenue|Ave|Blvd|Road|Rd|Lane|Ln|Drive|Dr|Plaza|Square|Sq)[\w\s,.-]{0,40})/i;
-  const match = combined.match(ADDRESS_RE);
-  return match?.[0]?.trim();
+// A line must have a STREET INDICATOR to be considered an address.
+// This prevents matching years (2022), prices, or history sentences.
+const STREET_INDICATORS = [
+  /\b(?:str|ul|bul|blvd?|nab|sq)\.\s+\w/i,              // Eastern European: str. Name
+  /\b(?:street|avenue|boulevard|road|drive|lane|plaza)\b/i, // Western
+  /\boffice\s+\w/i,                                        // "Office Razgrad"
+  /\b(?:address|headquarters?|hq)\s*:/i,                   // explicit label
+];
+
+// Detect CSS / style content so we never return it as an address
+function looksLikeCss(text: string): boolean {
+  return /[{}]|!important|:\s*#[0-9a-f]{3,6}|:\s*\d+px|rgba?\(|border|margin|padding|font-size|background/i.test(text);
+}
+
+function extractLocation(pages: CrawledPage[]): string | undefined {
+  // 1. Semantic <address> HTML element
+  for (const page of pages) {
+    if (!page.html) continue;
+    const $ = cheerio.load(page.html);
+    const text = $('address').first().text().replace(/\s+/g, ' ').trim();
+    if (text.length > 8 && !looksLikeCss(text)) return text;
+  }
+
+  // 2. Elements with explicit "address" in class (NOT "location" — too broad)
+  for (const page of pages) {
+    if (!page.html) continue;
+    const $ = cheerio.load(page.html);
+    let found: string | undefined;
+    $('[class*="address"]').each((_i, el) => {
+      if (found) return;
+      const text = $(el).text().replace(/\s+/g, ' ').trim();
+      if (text.length > 8 && text.length < 300 && !looksLikeCss(text)) found = text;
+    });
+    if (found) return found;
+  }
+
+  // 3. Text-based: lines that contain a street indicator (not just any 4-digit number)
+  const combined = pages.map((p) => p.text).join('\n');
+  const lines = combined
+    .split('\n')
+    .map((l) => l.replace(/\s+/g, ' ').trim())
+    .filter((l) => l.length > 8 && l.length < 200);
+
+  const addresses: string[] = [];
+  const seenKeys = new Set<string>();
+
+  for (const line of lines) {
+    // Must have a street indicator — this rejects "established in 2022" etc.
+    if (!STREET_INDICATORS.some((re) => re.test(line))) continue;
+    if (looksLikeCss(line)) continue;
+    const key = line.toLowerCase().replace(/\s/g, '');
+    if (seenKeys.has(key)) continue;
+    seenKeys.add(key);
+    addresses.push(line);
+    if (addresses.length >= 2) break;
+  }
+
+  return addresses.length ? addresses.join(' | ') : undefined;
+}
+
+// ── Services ──────────────────────────────────────────────────────────────────
+
+const SERVICE_HEADING_RE = /^(?:services?|what we (?:do|offer|provide|build)|our (?:services?|solutions?|work|expertise)|capabilities?|specializ\w+)$/i;
+const SERVICE_CONTEXT_RE = /service|solution|what we (do|offer|provide|build)|our work|expertise|capabilities|specializ/i;
+
+// Stop scanning when we hit the start of a clearly different section
+const STOP_SECTION_RE  = /^(?:about\s*us?|our\s*team|meet\s*(?:our|the)\s*team|contact\s*(?:us)?|clients?|partners?|testimonials?|blog|news|portfolio|pricing|home|get\s*in\s*touch|careers?)$/i;
+
+function extractServicesFromHtml(pages: CrawledPage[]): Set<string> {
+  const items = new Set<string>();
+
+  for (const page of pages) {
+    if (!page.html) continue;
+    const $ = cheerio.load(page.html);
+
+    // Strategy 1: heading with service keywords → adjacent list or sibling cards
+    $('h1, h2, h3, h4').each((_i, el) => {
+      const heading = $(el).text().toLowerCase().trim();
+      if (!SERVICE_CONTEXT_RE.test(heading)) return;
+
+      // Adjacent <ul>/<ol>
+      $(el).nextAll('ul, ol').first().find('li').each((_j, li) => {
+        const t = $(li).clone().children('ul, ol').remove().end().text().trim().split('\n')[0].trim();
+        if (t.length > 2 && t.length < 120) items.add(t);
+      });
+
+      // Cards/headings inside the nearest section/div container
+      $(el).closest('section, div[class]').find('h3, h4, [class*="card"] h3, [class*="service"] h4, [class*="item"] h4').each((_j, card) => {
+        if (card === el) return;
+        const t = $(card).text().trim().split('\n')[0].trim();
+        if (t.length > 2 && t.length < 120 && !SERVICE_CONTEXT_RE.test(t.toLowerCase())) items.add(t);
+      });
+    });
+
+    // Strategy 2: elements whose class name signals a service block
+    $('[class*="service"],[class*="solution"],[class*="offering"],[class*="capability"],[class*="feature"]').each((_i, el) => {
+      // Skip the outer wrapper (it would grab the section heading)
+      if ($(el).find('[class*="service"],[class*="card"],[class*="item"]').length > 2) return;
+      const title = $(el).find('h2, h3, h4, strong').first().text().trim().split('\n')[0].trim();
+      if (title.length > 2 && title.length < 120) items.add(title);
+    });
+  }
+
+  return items;
+}
+
+/**
+ * Text-based fallback — works even when the services section is JS-rendered
+ * (Cheerio gets the text via $.text() before JS hydration is stripped).
+ */
+function extractServicesFromText(pages: CrawledPage[]): string[] {
+  for (const page of pages) {
+    const lines = page.text.split('\n').map((l) => l.trim()).filter((l) => l.length > 0);
+    let collecting = false;
+    const items: string[] = [];
+
+    for (const line of lines) {
+      if (SERVICE_HEADING_RE.test(line)) {
+        collecting = true;
+        continue;
+      }
+      if (!collecting) continue;
+      if (STOP_SECTION_RE.test(line)) break;
+
+      // Skip lines that are sentences, too long, or purely numeric
+      if (line.length < 3 || line.length > 80) continue;
+      if (/[.!?]$/.test(line)) continue;
+      if (/^\d+$/.test(line)) continue;
+      // Skip lines that look like nav links or generic words
+      if (/^(?:home|contact|about|blog|login|sign\s*in|read\s*more|learn\s*more|get\s*started)$/i.test(line)) continue;
+
+      items.push(line);
+      if (items.length >= 15) break;
+    }
+
+    if (items.length >= 2) return items;
+  }
+  return [];
 }
 
 function extractServices(pages: CrawledPage[]): string[] {
-  const servicePage = pages.find(
-    (p) => p.url.includes('/service') || p.url.includes('/solution')
-  );
-  const source = servicePage ?? pages[0];
-  if (!source?.html) return [];
+  const htmlItems = extractServicesFromHtml(pages);
+  if (htmlItems.size > 0) return [...htmlItems].slice(0, 20);
 
-  const $ = cheerio.load(source.html);
-  const items: string[] = [];
+  // Fallback: text-based scan (handles SSR pages where JS sections aren't in static HTML)
+  return extractServicesFromText(pages);
+}
 
-  // Try lists under headings that sound like services
-  $('h2, h3').each((_i, el) => {
-    const heading = $(el).text().toLowerCase();
-    if (heading.includes('service') || heading.includes('solution') || heading.includes('what we')) {
-      $(el).next('ul, ol').find('li').each((_j, li) => {
-        const t = $(li).text().trim();
-        if (t.length > 2 && t.length < 100) items.push(t);
+// ── Team ──────────────────────────────────────────────────────────────────────
+
+// Selectors for person cards — ordered from specific to broad
+const TEAM_CARD_SELECTORS = [
+  '[class*="team-member"], [class*="team-card"], [class*="team-item"]',
+  '[class*="member-card"], [class*="person-card"], [class*="staff-card"]',
+  '[class*="team"] [class*="card"], [class*="team"] [class*="item"], [class*="team"] article',
+  '[class*="member"], [class*="person"], [class*="staff"], [class*="employee"]',
+  '[class*="people"] [class*="card"], [class*="people"] article',
+  '[class*="bio"], [class*="profile-card"]',
+];
+
+const NAME_SELECTORS   = 'h2, h3, h4, [class*="name"], strong';
+const ROLE_SELECTORS   = 'p, span, [class*="role"], [class*="title"], [class*="position"], [class*="job"], em, small';
+const EMAIL_RE_LOCAL   = /[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}/;
+
+function extractTeam(pages: CrawledPage[]): TeamMember[] {
+  const members: TeamMember[] = [];
+  const seen = new Set<string>();
+
+  for (const page of pages) {
+    if (!page.html) continue;
+    const $ = cheerio.load(page.html);
+
+    // Strategy 1: try known card selectors
+    for (const sel of TEAM_CARD_SELECTORS) {
+      const cards = $(sel);
+      if (cards.length === 0) continue;
+
+      cards.each((_i, card) => {
+        const $card = $(card);
+        const name = $card.find(NAME_SELECTORS).first().text().trim().split('\n')[0].trim();
+        if (!name || name.length < 2 || name.length > 80) return;
+        if (seen.has(name.toLowerCase())) return;
+
+        const rawRole = $card.find(ROLE_SELECTORS).first().text().trim().split('\n')[0].trim();
+        const position = rawRole && rawRole !== name && rawRole.length < 100 ? rawRole : undefined;
+        const emailMatch = $card.text().match(EMAIL_RE_LOCAL);
+
+        seen.add(name.toLowerCase());
+        members.push({ name, position, email: emailMatch?.[0] });
+      });
+
+      if (members.length > 0) break; // found cards, don't try next selector
+    }
+
+    // Strategy 2: section heading "team"/"people"/"meet" → sibling headings = names
+    if (members.length === 0) {
+      $('h1, h2, h3').each((_i, el) => {
+        const headingText = $(el).text().toLowerCase();
+        if (!/(?:our\s+)?(?:team|people|staff)|meet\s+(?:our|the)/.test(headingText)) return;
+
+        $(el).closest('section, div').find('h3, h4').each((_j, nameEl) => {
+          if (nameEl === el) return;
+          const name = $(nameEl).text().trim().split('\n')[0].trim();
+          if (!name || name.length < 2 || name.length > 80) return;
+          if (seen.has(name.toLowerCase())) return;
+
+          const rawRole = $(nameEl).next(ROLE_SELECTORS).first().text().trim().split('\n')[0].trim();
+          const position = rawRole && rawRole.length < 100 ? rawRole : undefined;
+
+          seen.add(name.toLowerCase());
+          members.push({ name, position });
+        });
       });
     }
-  });
+  }
 
-  return [...new Set(items)].slice(0, 20);
+  return members.slice(0, 50);
 }
 
-function extractTeam(pages: CrawledPage[]): string[] {
-  const teamPage = pages.find((p) => p.url.includes('/team') || p.url.includes('/about'));
-  if (!teamPage?.html) return [];
-
-  const $ = cheerio.load(teamPage.html);
-  const members: string[] = [];
-
-  // Common patterns: headings inside team cards
-  $('[class*="team"] h3, [class*="team"] h4, [class*="member"] h3, [class*="member"] h4').each(
-    (_i, el) => {
-      const name = $(el).text().trim();
-      if (name.length > 2 && name.length < 60) members.push(name);
-    }
-  );
-
-  return [...new Set(members)].slice(0, 50);
-}
+// ── History ───────────────────────────────────────────────────────────────────
 
 function extractHistory(pages: CrawledPage[]): string | undefined {
   const aboutPage = pages.find((p) => p.url.includes('/about') || p.url.includes('/history'));
@@ -156,6 +333,8 @@ function extractHistory(pages: CrawledPage[]): string | undefined {
   return history || undefined;
 }
 
+// ── Completion score ──────────────────────────────────────────────────────────
+
 const FIELD_WEIGHTS: Record<string, number> = {
   name: 20,
   description: 20,
@@ -170,36 +349,35 @@ const FIELD_WEIGHTS: Record<string, number> = {
 
 function computeCompletionScore(profile: Omit<ExtractedProfile, 'completionScore'>): number {
   let score = 0;
-  if (profile.name) score += FIELD_WEIGHTS.name;
-  if (profile.description) score += FIELD_WEIGHTS.description;
-  if (profile.location) score += FIELD_WEIGHTS.location;
-  if (profile.emails.length > 0) score += FIELD_WEIGHTS.emails;
-  if (profile.phones.length > 0) score += FIELD_WEIGHTS.phones;
-  if (profile.services.length > 0) score += FIELD_WEIGHTS.services;
-  if (profile.team.length > 0) score += FIELD_WEIGHTS.team;
-  if (profile.history) score += FIELD_WEIGHTS.history;
-  if (Object.keys(profile.socialLinks).length > 0) score += FIELD_WEIGHTS.socialLinks;
+  if (profile.name)                            score += FIELD_WEIGHTS.name;
+  if (profile.description)                     score += FIELD_WEIGHTS.description;
+  if (profile.location)                        score += FIELD_WEIGHTS.location;
+  if (profile.emails.length > 0)               score += FIELD_WEIGHTS.emails;
+  if (profile.phones.length > 0)               score += FIELD_WEIGHTS.phones;
+  if (profile.services.length > 0)             score += FIELD_WEIGHTS.services;
+  if (profile.team.length > 0)                 score += FIELD_WEIGHTS.team;
+  if (profile.history)                         score += FIELD_WEIGHTS.history;
+  if (Object.keys(profile.socialLinks).length) score += FIELD_WEIGHTS.socialLinks;
   return score;
 }
+
+// ── Main entry point ──────────────────────────────────────────────────────────
 
 export function extractProfile(pages: CrawledPage[]): ExtractedProfile {
   const allEmails = [...new Set(pages.flatMap((p) => p.emails))];
   const allPhones = [...new Set(pages.flatMap((p) => p.phones))];
 
   const base = {
-    name: extractCompanyName(pages),
+    name:        extractCompanyName(pages),
     description: extractDescription(pages),
-    location: extractLocation(pages),
-    emails: allEmails,
-    phones: allPhones,
-    services: extractServices(pages),
-    team: extractTeam(pages),
-    history: extractHistory(pages),
+    location:    extractLocation(pages),
+    emails:      allEmails,
+    phones:      allPhones,
+    services:    extractServices(pages),
+    team:        extractTeam(pages),
+    history:     extractHistory(pages),
     socialLinks: extractSocialLinks(pages),
   };
 
-  return {
-    ...base,
-    completionScore: computeCompletionScore(base),
-  };
+  return { ...base, completionScore: computeCompletionScore(base) };
 }

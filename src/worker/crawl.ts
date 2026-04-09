@@ -12,15 +12,33 @@ export interface CrawledPage {
 
 const EMAIL_RE = /[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}/g;
 
-// Matches common phone formats: +1 (555) 555-5555, +44 20 7946 0958, etc.
-// Requires at least one separator (space, dash, dot, parens) to avoid matching raw integers
-const PHONE_RE = /(\+?(?:\d{1,3}[\s.\-])?(?:\(?\d{2,4}\)?[\s.\-]){1,3}\d{3,4})/g;
+// Strict phone regex: must start with +/00 (international) or 0 (local)
+// This rejects standalone numbers like 226.5000 or coordinates
+const PHONE_RE = /(?<!\d)((?:\+\d{1,3}|00\d{1,3})[\s\-.()]*(?: *\d[\s\-.()]*){6,14}|0\d{1,4}[\s\-.](?:\d[\s\-.]?){5,11})(?![\d\-])/g;
 
-const JUNK_EMAIL_PREFIXES = ['noreply', 'no-reply', 'donotreply', 'git@', 'sender@', 'recipient@',
-  'user1@', 'user2@', 'reply@', 'open@', 'u003e'];
-const JUNK_EMAIL_DOMAINS = ['example.com', 'example.org', 'example.bg', 'cluster.mongodb.net'];
+const JUNK_EMAIL_PREFIXES = [
+  'noreply', 'no-reply', 'donotreply', 'git@', 'sender@', 'recipient@',
+  'user1@', 'user2@', 'reply@', 'open@', 'u003e',
+];
+const JUNK_EMAIL_DOMAINS = [
+  'example.com', 'example.org', 'example.bg',
+  'cluster.mongodb.net',
+  // Placeholder / demo domains frequently found in website HTML
+  'website.com', 'yourwebsite.com', 'yourdomain.com', 'domain.com',
+  'mysite.com', 'yoursite.com', 'yourcompany.com', 'company.com',
+  'email.com', 'mail.com', 'test.com', 'demo.com', 'placeholder.com',
+  'sentry.io',    // error tracking addresses, not contact emails
+  'sampleemail.com', 'mailserver.com',
+];
 
 const FALLBACK_PATHS = ['/about', '/team', '/services', '/contact', '/history'];
+
+// Pages where we must save the full HTML for structured extraction (team, services, etc.)
+const HTML_SAVE_PATHS = ['/team', '/about', '/services', '/service', '/contact', '/history', '/people', '/staff'];
+
+function shouldSaveHtml(url: string): boolean {
+  return HTML_SAVE_PATHS.some((p) => url.includes(p));
+}
 
 function extractEmails(text: string): string[] {
   const raw = text.match(EMAIL_RE) ?? [];
@@ -38,12 +56,14 @@ function extractPhones(text: string): string[] {
     .map((p) => p.trim())
     .filter((p) => {
       const digits = p.replace(/\D/g, '');
-      // Must have 7–15 digits (international standard)
+      // Must have 7–15 digits
       if (digits.length < 7 || digits.length > 15) return false;
-      // Reject date-like patterns: 2024-01-01, 2026-04-08
-      if (/^20\d{2}[-.]?\d{2}[-.]?\d{2}$/.test(p.trim())) return false;
-      // Must contain at least one separator to avoid raw integers
-      if (!/[\s\-().+]/.test(p)) return false;
+      // Reject date patterns: dd.mm.yyyy or dd-mm-yyyy
+      if (/^\d{1,2}[.\-/]\d{1,2}[.\-/]\d{2,4}$/.test(p)) return false;
+      // Reject decimal numbers (coordinates, prices): e.g. 226.5000
+      if (/^\d+\.\d+$/.test(p)) return false;
+      // Reject anything starting with a year (20xx...)
+      if (/^(19|20)\d{2}/.test(digits)) return false;
       return true;
     })
   )];
@@ -93,7 +113,6 @@ async function crawlWithCheerio(baseUrl: string): Promise<CrawledPage[]> {
   );
 
   await firstPass.run([baseUrl]);
-
   if (pages.length === 0) return pages;
 
   const $ = cheerio.load(homepageHtml);
@@ -107,10 +126,12 @@ async function crawlWithCheerio(baseUrl: string): Promise<CrawledPage[]> {
       requestHandlerTimeoutSecs: 20,
       async requestHandler({ $, request }) {
         const text = $.text();
+        // Save full HTML for pages that are needed for structured extraction
+        const html = shouldSaveHtml(request.url) ? $.html() : '';
         pages.push({
           url: request.url,
           text,
-          html: '',
+          html,
           emails: extractEmails(text),
           phones: extractPhones(text),
         });
@@ -154,7 +175,6 @@ async function crawlWithPlaywright(baseUrl: string): Promise<CrawledPage[]> {
   );
 
   await firstPass.run([baseUrl]);
-
   if (pages.length === 0 || !homepageHtml) return pages;
 
   const $ = cheerio.load(homepageHtml);
@@ -170,10 +190,12 @@ async function crawlWithPlaywright(baseUrl: string): Promise<CrawledPage[]> {
       async requestHandler({ page, request }) {
         await page.waitForLoadState('networkidle', { timeout: 10000 }).catch(() => {});
         const text = await page.evaluate(() => document.body.innerText);
+        // Save full HTML for important pages
+        const html = shouldSaveHtml(request.url) ? await page.content() : '';
         pages.push({
           url: request.url,
           text,
-          html: '',
+          html,
           emails: extractEmails(text),
           phones: extractPhones(text),
         });
