@@ -60,17 +60,19 @@ model TenantCompany {
 }
 
 model CrawlBatch {
-  id                   String      @id @default(uuid())
+  id                   String          @id @default(uuid())
   tenantId             String
   filePath             String?
   fileName             String?
-  status               BatchStatus @default(PENDING)
-  totalCompanies       Int         @default(0)
-  processedCompanies   Int         @default(0)
-  completionPercentage Float       @default(0)
+  sourceType           BatchSourceType @default(UPLOAD)
+  searchQuery          Json?
+  status               BatchStatus     @default(PENDING)
+  totalCompanies       Int             @default(0)
+  processedCompanies   Int             @default(0)
+  completionPercentage Float           @default(0)
   exportPath           String?
-  createdAt            DateTime    @default(now())
-  updatedAt            DateTime    @updatedAt
+  createdAt            DateTime        @default(now())
+  updatedAt            DateTime        @updatedAt
 
   tenant          Tenant          @relation(fields: [tenantId], references: [id])
   tenantCompanies TenantCompany[]
@@ -110,6 +112,11 @@ enum BatchStatus {
   PROCESSING
   COMPLETED
   FAILED
+}
+
+enum BatchSourceType {
+  UPLOAD
+  PERSONA_SEARCH
 }
 
 enum CrawlStatus {

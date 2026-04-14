@@ -64,6 +64,11 @@ function extractPhones(text: string): string[] {
       if (/^\d+\.\d+$/.test(p)) return false;
       // Reject anything starting with a year (20xx...)
       if (/^(19|20)\d{2}/.test(digits)) return false;
+      // Reject IPv4 addresses (e.g. 088.143.253.143)
+      if (/^\d+\.\d+\.\d+\.\d+$/.test(p.trim())) return false;
+      // Bulgarian numbers only: must start with +359 or 08
+      const normalized = p.replace(/[\s\-.()/]/g, '');
+      if (!normalized.startsWith('+359') && !normalized.startsWith('08')) return false;
       return true;
     })
   )];

@@ -77,11 +77,17 @@ function extractDescription(pages: CrawledPage[]): string | undefined {
 
   const $ = cheerio.load(homepage.html);
 
-  const metaDesc = $('meta[name="description"]').attr('content');
-  if (metaDesc && metaDesc.length > 20) return metaDesc.trim();
+  const MAX_DESC = 300;
 
-  const ogDesc = $('meta[property="og:description"]').attr('content');
-  if (ogDesc && ogDesc.length > 20) return ogDesc.trim();
+  const metaDesc = $('meta[name="description"]').attr('content')?.trim();
+  if (metaDesc && metaDesc.length > 20) {
+    return metaDesc.length > MAX_DESC ? metaDesc.slice(0, MAX_DESC).trimEnd() + '…' : metaDesc;
+  }
+
+  const ogDesc = $('meta[property="og:description"]').attr('content')?.trim();
+  if (ogDesc && ogDesc.length > 20) {
+    return ogDesc.length > MAX_DESC ? ogDesc.slice(0, MAX_DESC).trimEnd() + '…' : ogDesc;
+  }
 
   let fallback = '';
   $('p').each((_i, el) => {
@@ -89,7 +95,8 @@ function extractDescription(pages: CrawledPage[]): string | undefined {
     if (!fallback && t.length > 60) fallback = t;
   });
 
-  return fallback || undefined;
+  if (!fallback) return undefined;
+  return fallback.length > MAX_DESC ? fallback.slice(0, MAX_DESC).trimEnd() + '…' : fallback;
 }
 
 // ── Location ──────────────────────────────────────────────────────────────────

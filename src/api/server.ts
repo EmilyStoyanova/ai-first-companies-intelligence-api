@@ -10,6 +10,7 @@ import authRouter from './routes/auth';
 import batchesRouter from './routes/batches';
 import companiesRouter from './routes/companies';
 import exportsRouter from './routes/exports';
+import personaRouter from './routes/persona';
 
 const app = express();
 const PORT = parseInt(process.env.PORT || '3001', 10);
@@ -30,6 +31,7 @@ app.use('/api/auth', authRouter);
 app.use('/api/batches', batchesRouter);
 app.use('/api/companies', companiesRouter);
 app.use('/api/exports', exportsRouter);
+app.use('/api/persona-searches', personaRouter);
 
 app.use((req, res) => {
   res.status(404).json({ error: 'Not found' });
