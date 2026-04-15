@@ -50,10 +50,11 @@ model TenantCompany {
   tenantId      String
   companyId     String
   sourceBatchId String?
+  excluded      Boolean  @default(false)
   createdAt     DateTime @default(now())
 
-  tenant      Tenant     @relation(fields: [tenantId], references: [id])
-  company     Company    @relation(fields: [companyId], references: [id])
+  tenant      Tenant      @relation(fields: [tenantId], references: [id])
+  company     Company     @relation(fields: [companyId], references: [id])
   sourceBatch CrawlBatch? @relation(fields: [sourceBatchId], references: [id])
 
   @@id([tenantId, companyId])
@@ -74,8 +75,9 @@ model CrawlBatch {
   createdAt            DateTime        @default(now())
   updatedAt            DateTime        @updatedAt
 
-  tenant          Tenant          @relation(fields: [tenantId], references: [id])
-  tenantCompanies TenantCompany[]
+  tenant               Tenant               @relation(fields: [tenantId], references: [id])
+  tenantCompanies      TenantCompany[]
+  discoveryCandidates  DiscoveryCandidate[]
 }
 
 model RawCompanyProfile {
@@ -105,6 +107,28 @@ model CompanyProfile {
   updatedAt       DateTime @updatedAt
 
   company Company @relation(fields: [companyId], references: [id])
+}
+
+model DiscoveryCandidate {
+  id        String          @id @default(uuid())
+  batchId   String
+  domain    String
+  url       String
+  title     String?
+  snippet   String?
+  status    CandidateStatus @default(KEPT)
+  createdAt DateTime        @default(now())
+
+  batch CrawlBatch @relation(fields: [batchId], references: [id], onDelete: Cascade)
+
+  @@unique([batchId, domain])
+}
+
+enum CandidateStatus {
+  KEPT
+  FILTERED
+  BLOCKED
+  EXCLUDED
 }
 
 enum BatchStatus {

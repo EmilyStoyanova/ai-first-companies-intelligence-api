@@ -104,15 +104,21 @@ function extractDescription(pages: CrawledPage[]): string | undefined {
 // A line must have a STREET INDICATOR to be considered an address.
 // This prevents matching years (2022), prices, or history sentences.
 const STREET_INDICATORS = [
-  /\b(?:str|ul|bul|blvd?|nab|sq)\.\s+\w/i,              // Eastern European: str. Name
+  /\b(?:str|ul|bul|blvd?|nab|sq)\.\s*["«»]?\w/i,         // Latin Eastern European: ul. / str. (quotes allowed)
+  /(?:ул|бул|пл|кв|ж\.к|жк)\.\s*["«»]?\S/iu,             // Cyrillic Bulgarian: ул., бул., пл., кв., ж.к.
   /\b(?:street|avenue|boulevard|road|drive|lane|plaza)\b/i, // Western
-  /\boffice\s+\w/i,                                        // "Office Razgrad"
-  /\b(?:address|headquarters?|hq)\s*:/i,                   // explicit label
+  /\boffice\s+\w/i,                                         // "Office Razgrad"
+  /\b(?:address|headquarters?|hq)\s*:/i,                    // explicit label
 ];
 
 // Detect CSS / style content so we never return it as an address
 function looksLikeCss(text: string): boolean {
   return /[{}]|!important|:\s*#[0-9a-f]{3,6}|:\s*\d+px|rgba?\(|border|margin|padding|font-size|background/i.test(text);
+}
+
+// Detect Apache/Nginx server banners that appear in <address> on error pages
+function looksLikeServerBanner(text: string): boolean {
+  return /^apache\b|^nginx\b|^microsoft-iis\b|server at .+ port \d+/i.test(text);
 }
 
 function extractLocation(pages: CrawledPage[]): string | undefined {
@@ -121,7 +127,7 @@ function extractLocation(pages: CrawledPage[]): string | undefined {
     if (!page.html) continue;
     const $ = cheerio.load(page.html);
     const text = $('address').first().text().replace(/\s+/g, ' ').trim();
-    if (text.length > 8 && !looksLikeCss(text)) return text;
+    if (text.length > 8 && !looksLikeCss(text) && !looksLikeServerBanner(text)) return text;
   }
 
   // 2. Elements with explicit "address" in class (NOT "location" — too broad)

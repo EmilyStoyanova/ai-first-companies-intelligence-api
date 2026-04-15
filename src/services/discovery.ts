@@ -5,11 +5,14 @@ export interface DiscoveryParams {
   maxResults?: number;
 }
 
+export type CandidateStatus = 'kept' | 'filtered' | 'blocked';
+
 export interface DiscoveredSite {
   url: string;
   domain: string;
   title?: string;
   snippet?: string;
+  status: CandidateStatus;
 }
 
 function extractDomain(rawUrl: string): string | null {
@@ -115,8 +118,14 @@ async function fetchBraveQuery(apiKey: string, query: string): Promise<Discovere
 
   for (const item of data.web?.results ?? []) {
     const domain = extractDomain(item.url);
-    if (!domain || shouldSkip(domain)) continue;
-    results.push({ url: item.url, domain, title: item.title, snippet: item.description });
+    if (!domain) continue;
+    results.push({
+      url: item.url,
+      domain,
+      title: item.title,
+      snippet: item.description,
+      status: shouldSkip(domain) ? 'blocked' : 'kept',
+    });
   }
 
   return results;
@@ -127,19 +136,19 @@ function buildQueryVariations(params: DiscoveryParams): string[] {
   if (params.keywords?.trim()) base.push(params.keywords.trim());
 
   return [
-    [...base, 'официален сайт'].join(' '),   // "official site" — biases toward org homepages
-    [...base, 'контакти'].join(' '),          // "contacts" — surfaces real business contact pages
-    [...base, 'услуги'].join(' '),            // "services" — surfaces real service provider pages
+    [...base, 'официален сайт'].join(' '),
+    [...base, 'контакти'].join(' '),
+    [...base, 'услуги'].join(' '),
   ];
 }
 
-async function searchViaBrave(maxResults: number, params: DiscoveryParams): Promise<DiscoveredSite[]> {
+async function searchViaBrave(params: DiscoveryParams): Promise<DiscoveredSite[]> {
   const apiKey = process.env.BRAVE_SEARCH_API_KEY!;
   const variations = buildQueryVariations(params);
 
   const pages = await Promise.all(variations.map((q) => fetchBraveQuery(apiKey, q)));
 
-  // Merge, deduplicate by domain, cap at maxResults
+  // Merge, deduplicate by domain — keep ALL (blocked + kept)
   const seen = new Set<string>();
   const results: DiscoveredSite[] = [];
 
@@ -148,7 +157,6 @@ async function searchViaBrave(maxResults: number, params: DiscoveryParams): Prom
       if (seen.has(site.domain)) continue;
       seen.add(site.domain);
       results.push(site);
-      if (results.length >= maxResults) return results;
     }
   }
 
@@ -156,15 +164,17 @@ async function searchViaBrave(maxResults: number, params: DiscoveryParams): Prom
 }
 
 // ── Groq relevance filter ─────────────────────────────────────────────────────
-// Uses llama-3.1-8b-instant (fast, free tier) to keep only real company/org
-// websites and drop directories, aggregators, government portals, etc.
-// Gracefully degrades to returning all results when GROQ_API_KEY is not set.
+// Sends only 'kept' candidates to Groq. Non-selected ones get status 'filtered'.
+// 'blocked' candidates are never sent to Groq — their status stays 'blocked'.
+// Gracefully degrades when GROQ_API_KEY is not set (all 'kept' stay 'kept').
 
 async function groqRelevanceFilter(
   sites: DiscoveredSite[],
   params: DiscoveryParams,
 ): Promise<DiscoveredSite[]> {
-  if (sites.length === 0) return sites;
+  // Only send non-blocked candidates to Groq
+  const candidates = sites.filter((s) => s.status === 'kept');
+  if (candidates.length === 0) return sites;
 
   const apiKey = process.env.GROQ_API_KEY;
   if (!apiKey) {
@@ -172,7 +182,7 @@ async function groqRelevanceFilter(
     return sites;
   }
 
-  const items = sites
+  const items = candidates
     .map((s, i) => `${i}: ${s.title ?? s.domain} — ${s.snippet ?? ''}`)
     .join('\n');
 
@@ -262,17 +272,32 @@ async function groqRelevanceFilter(
     }
 
     const data = await res.json() as { choices: Array<{ message: { content: string } }> };
-    const content = data.choices[0]?.message?.content?.trim() ?? '';
+    const raw = data.choices[0]?.message?.content?.trim() ?? '';
 
-    const indices: unknown = JSON.parse(content);
+    // Strip markdown code fences and extract the JSON array — LLMs sometimes wrap output
+    const match = raw.match(/\[[\d,\s]*\]/);
+    if (!match) throw new Error(`no JSON array in Groq response: ${raw.slice(0, 80)}`);
+
+    const indices: unknown = JSON.parse(match[0]);
     if (!Array.isArray(indices)) throw new Error('not an array');
 
-    const kept = (indices as unknown[])
-      .filter((i): i is number => typeof i === 'number' && i >= 0 && i < sites.length)
-      .map((i) => sites[i]);
+    const keptIndices = new Set(
+      (indices as unknown[]).filter(
+        (i): i is number => typeof i === 'number' && i >= 0 && i < candidates.length,
+      ),
+    );
 
-    console.log(`[discovery] Groq filter: ${sites.length} → ${kept.length} sites`);
-    return kept;
+    // Rebuild full list: blocked stays blocked, kept→filtered if Groq rejected
+    let candidateIdx = 0;
+    const result = sites.map((site) => {
+      if (site.status !== 'kept') return site;
+      const idx = candidateIdx++;
+      return keptIndices.has(idx) ? site : { ...site, status: 'filtered' as const };
+    });
+
+    const keptCount = result.filter((s) => s.status === 'kept').length;
+    console.log(`[discovery] Groq filter: ${candidates.length} candidates → ${keptCount} kept`);
+    return result;
   } catch (err) {
     console.warn('[discovery] Groq filter failed — returning unfiltered results:', err);
     return sites;
@@ -280,16 +305,16 @@ async function groqRelevanceFilter(
 }
 
 // ── Main entry point ──────────────────────────────────────────────────────────
+// Returns ALL candidates (kept + filtered + blocked) so the worker can persist
+// them and the UI can show the full picture.
 
 export async function discoverSites(params: DiscoveryParams): Promise<DiscoveredSite[]> {
-  const maxResults = Math.min(params.maxResults ?? 50, BRAVE_COUNT * 3);
-
   if (!process.env.BRAVE_SEARCH_API_KEY) {
     throw new Error('BRAVE_SEARCH_API_KEY is not set.');
   }
 
-  console.log(`[discovery] queries=${JSON.stringify(buildQueryVariations(params))} max=${maxResults}`);
+  console.log(`[discovery] queries=${JSON.stringify(buildQueryVariations(params))}`);
 
-  const raw = await searchViaBrave(maxResults, params);
+  const raw = await searchViaBrave(params);
   return groqRelevanceFilter(raw, params);
 }

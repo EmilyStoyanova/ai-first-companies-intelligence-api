@@ -31,23 +31,45 @@ const JUNK_EMAIL_DOMAINS = [
   'sampleemail.com', 'mailserver.com',
 ];
 
-const FALLBACK_PATHS = ['/about', '/team', '/services', '/contact', '/history'];
+const FALLBACK_PATHS = ['/about', '/team', '/services', '/contact', '/contacts', '/kontakti', '/контакти', '/history'];
 
 // Pages where we must save the full HTML for structured extraction (team, services, etc.)
-const HTML_SAVE_PATHS = ['/team', '/about', '/services', '/service', '/contact', '/history', '/people', '/staff'];
+const HTML_SAVE_PATHS = ['/team', '/about', '/services', '/service', '/contact', '/contacts', '/kontakti', '/history', '/people', '/staff'];
 
 function shouldSaveHtml(url: string): boolean {
   return HTML_SAVE_PATHS.some((p) => url.includes(p));
 }
 
-function extractEmails(text: string): string[] {
-  const raw = text.match(EMAIL_RE) ?? [];
+function filterEmails(raw: string[]): string[] {
   return [...new Set(raw.filter((e) => {
     const lower = e.toLowerCase();
     if (JUNK_EMAIL_PREFIXES.some((p) => lower.startsWith(p) || lower.includes(p))) return false;
     if (JUNK_EMAIL_DOMAINS.some((d) => lower.endsWith(`@${d}`))) return false;
     return true;
   }))];
+}
+
+function extractEmails(text: string): string[] {
+  return filterEmails(text.match(EMAIL_RE) ?? []);
+}
+
+// Also extract emails from mailto: href attributes — many sites put emails
+// only in <a href="mailto:..."> with no visible text (icon links, etc.)
+function extractEmailsFromHtml(html: string): string[] {
+  if (!html) return [];
+  const $ = cheerio.load(html);
+  const found: string[] = [];
+  $('a[href^="mailto:"], a[href^="MAILTO:"]').each((_i, el) => {
+    const href = $(el).attr('href') ?? '';
+    const email = href.replace(/^mailto:/i, '').split('?')[0].trim();
+    if (EMAIL_RE.test(email)) found.push(email);
+    EMAIL_RE.lastIndex = 0; // reset stateful regex
+  });
+  return filterEmails(found);
+}
+
+function mergeEmails(text: string, html: string): string[] {
+  return [...new Set([...extractEmails(text), ...extractEmailsFromHtml(html)])];
 }
 
 function extractPhones(text: string): string[] {
@@ -106,7 +128,7 @@ async function crawlWithCheerio(baseUrl: string): Promise<CrawledPage[]> {
           url: request.url,
           text,
           html: homepageHtml,
-          emails: extractEmails(text),
+          emails: mergeEmails(text, homepageHtml),
           phones: extractPhones(text),
         });
       },
@@ -132,13 +154,13 @@ async function crawlWithCheerio(baseUrl: string): Promise<CrawledPage[]> {
       navigationTimeoutSecs: 10,
       async requestHandler({ $, request }) {
         const text = $.text();
+        const html = $.html();
         // Save full HTML for pages that are needed for structured extraction
-        const html = shouldSaveHtml(request.url) ? $.html() : '';
         pages.push({
           url: request.url,
           text,
-          html,
-          emails: extractEmails(text),
+          html: shouldSaveHtml(request.url) ? html : '',
+          emails: mergeEmails(text, html),
           phones: extractPhones(text),
         });
       },
@@ -169,7 +191,7 @@ async function crawlWithPlaywright(baseUrl: string): Promise<CrawledPage[]> {
           url: request.url,
           text,
           html,
-          emails: extractEmails(text),
+          emails: mergeEmails(text, html),
           phones: extractPhones(text),
         });
       },
@@ -197,13 +219,12 @@ async function crawlWithPlaywright(baseUrl: string): Promise<CrawledPage[]> {
       async requestHandler({ page, request }) {
         await page.waitForLoadState('networkidle', { timeout: 10000 }).catch(() => {});
         const text = await page.evaluate(() => document.body.innerText);
-        // Save full HTML for important pages
-        const html = shouldSaveHtml(request.url) ? await page.content() : '';
+        const html = await page.content();
         pages.push({
           url: request.url,
           text,
-          html,
-          emails: extractEmails(text),
+          html: shouldSaveHtml(request.url) ? html : '',
+          emails: mergeEmails(text, html),
           phones: extractPhones(text),
         });
       },

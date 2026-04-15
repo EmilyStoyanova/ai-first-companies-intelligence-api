@@ -112,25 +112,21 @@ async function processSingleJob(job: PgBoss.JobWithMetadata<CrawlCompanyPayload>
 }
 
 async function updateBatchProgress(batchId: string): Promise<void> {
-  const batch = await prisma.crawlBatch.findUnique({
+  // Atomic increment — avoids read-modify-write race with concurrent workers
+  const batch = await prisma.crawlBatch.update({
     where: { id: batchId },
+    data: { processedCompanies: { increment: 1 } },
     select: { totalCompanies: true, processedCompanies: true },
   });
-  if (!batch) return;
 
-  const newProcessed = batch.processedCompanies + 1;
   const percentage = batch.totalCompanies > 0
-    ? (newProcessed / batch.totalCompanies) * 100
+    ? (batch.processedCompanies / batch.totalCompanies) * 100
     : 0;
-  const status = newProcessed >= batch.totalCompanies ? 'COMPLETED' : 'PROCESSING';
+  const status = batch.processedCompanies >= batch.totalCompanies ? 'COMPLETED' : 'PROCESSING';
 
   await prisma.crawlBatch.update({
     where: { id: batchId },
-    data: {
-      processedCompanies: newProcessed,
-      completionPercentage: percentage,
-      status,
-    },
+    data: { completionPercentage: percentage, status },
   });
 }
 
@@ -141,17 +137,25 @@ async function processDiscoverJob(
   console.log(`[worker/discover] starting discovery: "${persona}" in "${location}"`);
 
   try {
-    const sites = await discoverSites({ persona, location, keywords, maxResults });
+    const allSites = await discoverSites({ persona, location, keywords, maxResults });
+    const keptSites = allSites.filter((s) => s.status === 'kept');
 
-    // Deduplicate by domain
-    const seen = new Set<string>();
-    const unique = sites.filter((s) => {
-      if (seen.has(s.domain)) return false;
-      seen.add(s.domain);
-      return true;
-    });
+    // Persist all candidates (kept + filtered + blocked) for the UI
+    if (allSites.length > 0) {
+      await prisma.discoveryCandidate.createMany({
+        data: allSites.map((s) => ({
+          batchId,
+          domain: s.domain,
+          url: s.url,
+          title: s.title,
+          snippet: s.snippet,
+          status: s.status.toUpperCase() as 'KEPT' | 'FILTERED' | 'BLOCKED',
+        })),
+        skipDuplicates: true,
+      });
+    }
 
-    if (unique.length === 0) {
+    if (keptSites.length === 0) {
       console.log(`[worker/discover] no sites found for "${persona}" in "${location}"`);
       await prisma.crawlBatch.update({
         where: { id: batchId },
@@ -160,17 +164,17 @@ async function processDiscoverJob(
       return;
     }
 
-    console.log(`[worker/discover] found ${unique.length} sites`);
+    console.log(`[worker/discover] kept=${keptSites.length} total=${allSites.length}`);
 
-    // Update batch with the actual count
+    // Update batch with the count of sites to crawl
     await prisma.crawlBatch.update({
       where: { id: batchId },
-      data: { totalCompanies: unique.length },
+      data: { totalCompanies: keptSites.length },
     });
 
     const crawlQueue = await getQueue();
 
-    for (const site of unique) {
+    for (const site of keptSites) {
       const baseUrl = `https://${site.domain}`;
 
       const company = await prisma.company.upsert({
@@ -194,10 +198,10 @@ async function processDiscoverJob(
     // Increment tenant weekly usage
     await prisma.tenant.update({
       where: { id: tenantId },
-      data: { weeklyUsage: { increment: unique.length } },
+      data: { weeklyUsage: { increment: keptSites.length } },
     });
 
-    console.log(`[worker/discover] enqueued ${unique.length} crawl jobs for batch ${batchId}`);
+    console.log(`[worker/discover] enqueued ${keptSites.length} crawl jobs for batch ${batchId}`);
   } catch (err) {
     console.error('[worker/discover] failed:', err);
     await prisma.crawlBatch.update({

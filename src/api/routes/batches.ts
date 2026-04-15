@@ -237,10 +237,11 @@ router.post(
         },
       });
 
-      // Increment tenant usage
+      // Increment tenant usage — charge full domains.length, not just enqueued jobs,
+      // since cached-domain skips still count against the quota check above.
       await prisma.tenant.update({
         where: { id: tenantId },
-        data: { weeklyUsage: { increment: jobsEnqueued } },
+        data: { weeklyUsage: { increment: domains.length } },
       });
 
       res.status(201).json({
@@ -365,12 +366,12 @@ router.get('/:id/companies', requireAuth, async (req: Request, res: Response): P
     const [total, companies] = await Promise.all([
       prisma.company.count({
         where: {
-          tenantCompanies: { some: { tenantId, sourceBatchId: id } },
+          tenantCompanies: { some: { tenantId, sourceBatchId: id, excluded: false } },
         },
       }),
       prisma.company.findMany({
         where: {
-          tenantCompanies: { some: { tenantId, sourceBatchId: id } },
+          tenantCompanies: { some: { tenantId, sourceBatchId: id, excluded: false } },
         },
         include: { profile: true },
         skip,
@@ -448,6 +449,128 @@ router.get('/:id/download', requireAuth, async (req: Request, res: Response): Pr
     res.send(StorageService.read(exportPath));
   } catch (err) {
     console.error('[batches/:id/download]', err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// GET /batches/:id/candidates — all discovery candidates with statuses
+router.get('/:id/candidates', requireAuth, async (req: Request, res: Response): Promise<void> => {
+  const id = String(req.params.id);
+  const tenantId = req.user.tenantId;
+
+  try {
+    const batch = await prisma.crawlBatch.findFirst({ where: { id, tenantId } });
+    if (!batch) {
+      res.status(404).json({ error: 'Batch not found' });
+      return;
+    }
+
+    const candidates = await prisma.discoveryCandidate.findMany({
+      where: { batchId: id },
+      orderBy: { createdAt: 'asc' },
+    });
+
+    res.json(candidates);
+  } catch (err) {
+    console.error('[batches/:id/candidates]', err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// PATCH /batches/:id/candidates/:domain — promote/exclude a candidate
+router.patch('/:id/candidates/:domain', requireAuth, async (req: Request, res: Response): Promise<void> => {
+  const batchId = String(req.params.id);
+  const domain = String(req.params.domain);
+  const tenantId = req.user.tenantId;
+  const { action } = req.body as { action: 'exclude' | 'include' };
+
+  if (!['exclude', 'include'].includes(action)) {
+    res.status(400).json({ error: 'action must be "exclude" or "include"' });
+    return;
+  }
+
+  try {
+    const batch = await prisma.crawlBatch.findFirst({ where: { id: batchId, tenantId } });
+    if (!batch) {
+      res.status(404).json({ error: 'Batch not found' });
+      return;
+    }
+
+    const candidate = await prisma.discoveryCandidate.findUnique({
+      where: { batchId_domain: { batchId, domain } },
+    });
+    if (!candidate) {
+      res.status(404).json({ error: 'Candidate not found' });
+      return;
+    }
+
+    if (action === 'exclude') {
+      // KEPT → EXCLUDED: mark candidate + mark tenantCompany as excluded
+      await prisma.discoveryCandidate.update({
+        where: { batchId_domain: { batchId, domain } },
+        data: { status: 'EXCLUDED' },
+      });
+      await prisma.tenantCompany.updateMany({
+        where: {
+          tenantId,
+          sourceBatchId: batchId,
+          company: { domain },
+        },
+        data: { excluded: true },
+      });
+      await prisma.crawlBatch.update({
+        where: { id: batchId },
+        data: { totalCompanies: { decrement: 1 } },
+      });
+      res.json({ ok: true });
+    } else {
+      // include: two cases
+      if (candidate.status === 'EXCLUDED') {
+        // Re-include a previously excluded KEPT company
+        await prisma.discoveryCandidate.update({
+          where: { batchId_domain: { batchId, domain } },
+          data: { status: 'KEPT' },
+        });
+        await prisma.tenantCompany.updateMany({
+          where: { tenantId, sourceBatchId: batchId, company: { domain } },
+          data: { excluded: false },
+        });
+        await prisma.crawlBatch.update({
+          where: { id: batchId },
+          data: { totalCompanies: { increment: 1 } },
+        });
+        res.json({ ok: true });
+      } else {
+        // FILTERED or BLOCKED → KEPT: upsert company + tenantCompany, enqueue crawl
+        const baseUrl = `https://${domain}`;
+        const company = await prisma.company.upsert({
+          where: { domain },
+          create: { domain, baseUrl, name: candidate.title ?? undefined },
+          update: {},
+        });
+        await prisma.tenantCompany.upsert({
+          where: { tenantId_companyId: { tenantId, companyId: company.id } },
+          create: { tenantId, companyId: company.id, sourceBatchId: batchId },
+          update: { sourceBatchId: batchId, excluded: false },
+        });
+        await prisma.discoveryCandidate.update({
+          where: { batchId_domain: { batchId, domain } },
+          data: { status: 'KEPT' },
+        });
+        await prisma.crawlBatch.update({
+          where: { id: batchId },
+          data: { totalCompanies: { increment: 1 } },
+        });
+        const queue = await getQueue();
+        await enqueueCrawlJob(
+          { companyId: company.id, domain, baseUrl, batchId, tenantId },
+          queue,
+        );
+        res.json({ ok: true, crawlTriggered: true });
+      }
+    }
+  } catch (err) {
+    console.error('[batches/:id/candidates/:domain]', err);
     res.status(500).json({ error: 'Internal server error' });
   }
 });

@@ -34,7 +34,7 @@ interface ExportRow {
 async function fetchRows(batchId: string, tenantId: string): Promise<ExportRow[]> {
   const companies = await prisma.company.findMany({
     where: {
-      tenantCompanies: { some: { tenantId, sourceBatchId: batchId } },
+      tenantCompanies: { some: { tenantId, sourceBatchId: batchId, excluded: false } },
     },
     include: { profile: true },
   });
