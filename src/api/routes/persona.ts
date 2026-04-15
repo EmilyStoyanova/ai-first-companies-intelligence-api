@@ -61,7 +61,7 @@ router.post('/', requireAuth, async (req: Request, res: Response): Promise<void>
     return;
   }
 
-  const maxResults = Math.min(Math.max(parseInt(String(rawMax ?? 20), 10) || 20, 5), 50);
+  const maxResults = Math.min(Math.max(parseInt(String(rawMax ?? 50), 10) || 50, 5), 60);
   const tenantId = req.user.tenantId;
 
   try {

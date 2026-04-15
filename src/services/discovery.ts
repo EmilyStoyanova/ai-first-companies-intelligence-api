@@ -12,14 +12,6 @@ export interface DiscoveredSite {
   snippet?: string;
 }
 
-function buildQuery(params: DiscoveryParams): string {
-  const parts = [params.persona.trim(), params.location.trim()];
-  if (params.keywords?.trim()) parts.push(params.keywords.trim());
-  // Bias results toward real org websites rather than directories
-  parts.push('официален сайт');
-  return parts.join(' ');
-}
-
 function extractDomain(rawUrl: string): string | null {
   try {
     const u = new URL(rawUrl);
@@ -43,6 +35,10 @@ const SKIP_DOMAINS = [
   'registryagency.bg', 'brra.bg',
   'industryinfo.bg', 'korektnafirma.com',
   'businessaccountbg.com',
+  'vsichkifirmi.com', 'papagal.bg',
+  'varna.biz', 'sofia.biz', 'plovdiv.biz', 'burgas.biz',
+  // Classified ads portals
+  'bezplatno.net', 'olx.bg', 'bazar.bg', 'pazaruvaj.com',
   // Job boards
   'zaplata.bg', 'jobs.bg', 'rabota.bg', 'karieri.bg', 'bgjobs.com',
   // Service & professional marketplaces
@@ -68,6 +64,11 @@ const SKIP_DOMAINS = [
   'detskigradini.bg', 'detskitegradini.com', 'registarnadetskitegradini.com',
   // Review & travel aggregators
   'tripadvisor.com', 'tripadvisor.bg', 'yelp.com',
+  // Restaurant & venue directories
+  'zavedenia.com', 'menuonline.bg', 'restogo.bg',
+  'restaurant.bg', 'alakart.bg',
+  // Hotel & accommodation booking portals
+  'rezervaciq.com', 'booking.com', 'airbnb.com',
 ];
 
 // Pattern-based rules for domain families that can't be enumerated
@@ -93,20 +94,20 @@ interface BraveResult {
   description?: string;
 }
 
-async function searchViaBrave(query: string, maxResults: number): Promise<DiscoveredSite[]> {
-  const apiKey = process.env.BRAVE_SEARCH_API_KEY!;
-  const count = Math.min(maxResults, 20); // Brave free tier: max 20 per request
+const BRAVE_COUNT = 20; // Brave max results per request
 
+async function fetchBraveQuery(apiKey: string, query: string): Promise<DiscoveredSite[]> {
   const url =
     `https://api.search.brave.com/res/v1/web/search` +
-    `?q=${encodeURIComponent(query)}&count=${count}&country=ALL&search_lang=bg`;
+    `?q=${encodeURIComponent(query)}&count=${BRAVE_COUNT}&country=ALL&search_lang=bg`;
 
   const res = await fetch(url, {
     headers: { 'Accept': 'application/json', 'X-Subscription-Token': apiKey },
   });
 
   if (!res.ok) {
-    throw new Error(`Brave Search API error: ${res.status} ${await res.text()}`);
+    console.warn(`[discovery] Brave error for query "${query}": ${res.status}`);
+    return [];
   }
 
   const data = await res.json() as { web?: { results?: BraveResult[] } };
@@ -121,17 +122,174 @@ async function searchViaBrave(query: string, maxResults: number): Promise<Discov
   return results;
 }
 
+function buildQueryVariations(params: DiscoveryParams): string[] {
+  const base = [params.persona.trim(), params.location.trim()];
+  if (params.keywords?.trim()) base.push(params.keywords.trim());
+
+  return [
+    [...base, 'официален сайт'].join(' '),   // "official site" — biases toward org homepages
+    [...base, 'контакти'].join(' '),          // "contacts" — surfaces real business contact pages
+    [...base, 'услуги'].join(' '),            // "services" — surfaces real service provider pages
+  ];
+}
+
+async function searchViaBrave(maxResults: number, params: DiscoveryParams): Promise<DiscoveredSite[]> {
+  const apiKey = process.env.BRAVE_SEARCH_API_KEY!;
+  const variations = buildQueryVariations(params);
+
+  const pages = await Promise.all(variations.map((q) => fetchBraveQuery(apiKey, q)));
+
+  // Merge, deduplicate by domain, cap at maxResults
+  const seen = new Set<string>();
+  const results: DiscoveredSite[] = [];
+
+  for (const page of pages) {
+    for (const site of page) {
+      if (seen.has(site.domain)) continue;
+      seen.add(site.domain);
+      results.push(site);
+      if (results.length >= maxResults) return results;
+    }
+  }
+
+  return results;
+}
+
+// ── Groq relevance filter ─────────────────────────────────────────────────────
+// Uses llama-3.1-8b-instant (fast, free tier) to keep only real company/org
+// websites and drop directories, aggregators, government portals, etc.
+// Gracefully degrades to returning all results when GROQ_API_KEY is not set.
+
+async function groqRelevanceFilter(
+  sites: DiscoveredSite[],
+  params: DiscoveryParams,
+): Promise<DiscoveredSite[]> {
+  if (sites.length === 0) return sites;
+
+  const apiKey = process.env.GROQ_API_KEY;
+  if (!apiKey) {
+    console.warn('[discovery] GROQ_API_KEY not set — skipping LLM filter');
+    return sites;
+  }
+
+  const items = sites
+    .map((s, i) => `${i}: ${s.title ?? s.domain} — ${s.snippet ?? ''}`)
+    .join('\n');
+
+  const searchContext = [
+    `"${params.persona}"`,
+    `in "${params.location}"`,
+    params.keywords ? `(keywords: ${params.keywords})` : '',
+  ]
+    .filter(Boolean)
+    .join(' ');
+
+  const prompt =
+    `You are filtering web search results.
+
+    Goal:
+    Return ONLY results that are the official website of a SINGLE real-world company or organisation that matches the search intent.
+
+    Search intent:
+    "${searchContext}"
+
+    Results (index: title — snippet):
+    ${items}
+
+    Definition of "official website":
+    - The primary website owned/controlled by that company or organisation
+    - Represents exactly ONE entity (not multiple)
+    - Typically contains: services/products, contact info, about page, branding
+
+    STRICT KEEP rules:
+    - Must clearly represent ONE specific company or organisation
+    - Must match the search intent (e.g. IT company in Varna, kindergarten in Lovech)
+    - Local business websites are valid
+
+    STRICT DISCARD rules:
+    - Directories, aggregators, listings (e.g. "top companies", "catalog", "firms in X")
+    - Marketplace / classifieds
+    - Job boards
+    - Review sites (e.g. ratings, comparisons)
+    - Maps (Google Maps, etc.)
+    - Social media pages (Facebook, LinkedIn, Instagram)
+    - Government / municipality portals
+    - Wikipedia or informational sites
+    - Pages listing MULTIPLE businesses
+    - Generic landing pages not tied to a specific company
+
+    Edge cases:
+    - If unsure → DISCARD
+    - If multiple companies are mentioned → DISCARD
+    - If it's a subpage of a directory → DISCARD
+
+    Examples:
+
+    Search: "IT companies Varna"
+
+    KEEP:
+    - "XYZ Software Ltd – Custom Software Development"
+    - "ABC Tech Varna – IT Services"
+
+    DISCARD:
+    - "Top 10 IT Companies in Varna"
+    - "varnafirms.bg"
+    - "Yellow Pages Varna"
+    - "LinkedIn company listings"
+
+    Output format:
+    Return ONLY a JSON array of indices (e.g. [0,2,4])
+    No explanation. No text.`;
+
+  try {
+    const res = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${apiKey}`,
+      },
+      body: JSON.stringify({
+        model: 'llama-3.1-8b-instant',
+        messages: [{ role: 'user', content: prompt }],
+        temperature: 0,
+        max_tokens: 150,
+      }),
+    });
+
+    if (!res.ok) {
+      console.warn(`[discovery] Groq API error ${res.status} — skipping LLM filter`);
+      return sites;
+    }
+
+    const data = await res.json() as { choices: Array<{ message: { content: string } }> };
+    const content = data.choices[0]?.message?.content?.trim() ?? '';
+
+    const indices: unknown = JSON.parse(content);
+    if (!Array.isArray(indices)) throw new Error('not an array');
+
+    const kept = (indices as unknown[])
+      .filter((i): i is number => typeof i === 'number' && i >= 0 && i < sites.length)
+      .map((i) => sites[i]);
+
+    console.log(`[discovery] Groq filter: ${sites.length} → ${kept.length} sites`);
+    return kept;
+  } catch (err) {
+    console.warn('[discovery] Groq filter failed — returning unfiltered results:', err);
+    return sites;
+  }
+}
+
 // ── Main entry point ──────────────────────────────────────────────────────────
 
 export async function discoverSites(params: DiscoveryParams): Promise<DiscoveredSite[]> {
-  const maxResults = Math.min(params.maxResults ?? 20, 50);
-  const query = buildQuery(params);
-
-  console.log(`[discovery] query="${query}" max=${maxResults}`);
+  const maxResults = Math.min(params.maxResults ?? 50, BRAVE_COUNT * 3);
 
   if (!process.env.BRAVE_SEARCH_API_KEY) {
     throw new Error('BRAVE_SEARCH_API_KEY is not set.');
   }
 
-  return searchViaBrave(query, maxResults);
+  console.log(`[discovery] queries=${JSON.stringify(buildQueryVariations(params))} max=${maxResults}`);
+
+  const raw = await searchViaBrave(maxResults, params);
+  return groqRelevanceFilter(raw, params);
 }

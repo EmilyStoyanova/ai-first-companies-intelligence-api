@@ -14,6 +14,7 @@ B2B Data Enrichment Engine — upload a list of company domains, crawl their web
 | Database | PostgreSQL |
 | Queue | pg-boss |
 | Crawling | Crawlee (CheerioCrawler → PlaywrightCrawler fallback) |
+| Discovery | Brave Search API + Groq (llama-3.1-8b-instant) relevance filter |
 | Auth | JWT |
 | Docs | Swagger UI |
 | Email | Nodemailer (console fallback in dev) |
@@ -40,6 +41,14 @@ JWT_SECRET="your-secret-key"
 PORT=3001
 STORAGE_BASE_PATH="./storage"
 WORKER_CONCURRENCY=5
+
+# Persona search — Brave Search API (free tier: 2,000 queries/month)
+# https://api.search.brave.com
+BRAVE_SEARCH_API_KEY=your-brave-key
+
+# Relevance filter — Groq API (free tier, llama-3.1-8b-instant)
+# https://console.groq.com — optional, degrades gracefully if unset
+GROQ_API_KEY=your-groq-key
 
 # Optional — email confirmation (dev mode logs the link to console if omitted)
 EMAIL_HOST=smtp.example.com
@@ -92,6 +101,7 @@ All endpoints except `/api/auth/*` require `Authorization: Bearer <token>`.
 | `GET` | `/api/batches/:id/download?format=csv\|xlsx` | Download export |
 | `DELETE` | `/api/batches/:id` | Delete batch |
 | `GET` | `/api/companies/:domain` | Get company profile by domain |
+| `POST` | `/api/persona-searches` | Start a persona-based lead discovery search |
 
 ## Upload Format
 
@@ -108,12 +118,20 @@ Domains are normalized automatically (protocol stripped, `www` removed, lowercas
 
 ## How It Works
 
+### Upload flow (domain list)
+
 1. **Upload** — file parsed, domains normalized, `CrawlBatch` created, one pg-boss job per company enqueued
 2. **Deduplication** — companies crawled within 30 days are reused unless `force_recrawl=true`
-3. **Crawl** — CheerioCrawler fetches homepage + nav links + fallback paths (`/about`, `/team`, `/services`, `/contact`); falls back to Playwright for JS-heavy sites
+3. **Crawl** — CheerioCrawler fetches homepage + nav links + fallback paths (`/about`, `/team`, `/services`, `/contact`); falls back to Playwright for JS-heavy sites; hard 60 s timeout per domain
 4. **Extract** — name, description, location, emails, phones, services, team members (name/position/email), social links, completion score
 5. **Store** — raw pages → `RawCompanyProfile`; structured data → `CompanyProfile`
 6. **Export** — query results streamed as CSV or XLSX
+
+### Persona search flow (lead discovery)
+
+1. **Search** — three query variations (`официален сайт`, `контакти`, `услуги`) fire in parallel against Brave Search (20 results each, up to 60 candidates)
+2. **Filter** — static `SKIP_DOMAINS` blocklist removes known directories; Groq (`llama-3.1-8b-instant`) classifies remaining candidates and keeps only single-company official websites
+3. **Enqueue** — surviving domains are upserted as companies and enqueued as crawl jobs, same pipeline as the upload flow
 
 ## Scripts
 

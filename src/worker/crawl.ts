@@ -128,7 +128,8 @@ async function crawlWithCheerio(baseUrl: string): Promise<CrawledPage[]> {
   const secondPass = new CheerioCrawler(
     {
       maxRequestsPerCrawl: urlsToVisit.length,
-      requestHandlerTimeoutSecs: 20,
+      requestHandlerTimeoutSecs: 10,
+      navigationTimeoutSecs: 10,
       async requestHandler({ $, request }) {
         const text = $.text();
         // Save full HTML for pages that are needed for structured extraction
@@ -190,7 +191,8 @@ async function crawlWithPlaywright(baseUrl: string): Promise<CrawledPage[]> {
   const secondPass = new PlaywrightCrawler(
     {
       maxRequestsPerCrawl: urlsToVisit.length,
-      requestHandlerTimeoutSecs: 30,
+      requestHandlerTimeoutSecs: 15,
+      navigationTimeoutSecs: 15,
       launchContext: { launchOptions: { headless: true } },
       async requestHandler({ page, request }) {
         await page.waitForLoadState('networkidle', { timeout: 10000 }).catch(() => {});
@@ -214,14 +216,27 @@ async function crawlWithPlaywright(baseUrl: string): Promise<CrawledPage[]> {
   return pages;
 }
 
+const CRAWL_TIMEOUT_MS = 60_000;
+
 export async function crawlCompany(baseUrl: string): Promise<CrawledPage[]> {
-  let pages = await crawlWithCheerio(baseUrl);
+  const crawl = async (): Promise<CrawledPage[]> => {
+    let pages = await crawlWithCheerio(baseUrl);
 
-  const totalText = pages.reduce((acc, p) => acc + p.text.trim().length, 0);
-  if (pages.length === 0 || totalText < 200) {
-    console.log(`[crawl] Cheerio got little content for ${baseUrl}, falling back to Playwright`);
-    pages = await crawlWithPlaywright(baseUrl);
-  }
+    const totalText = pages.reduce((acc, p) => acc + p.text.trim().length, 0);
+    if (pages.length === 0 || totalText < 200) {
+      console.log(`[crawl] Cheerio got little content for ${baseUrl}, falling back to Playwright`);
+      pages = await crawlWithPlaywright(baseUrl);
+    }
 
-  return pages;
+    return pages;
+  };
+
+  const timeout = new Promise<CrawledPage[]>((resolve) =>
+    setTimeout(() => {
+      console.warn(`[crawl] timeout after ${CRAWL_TIMEOUT_MS / 1000}s for ${baseUrl}`);
+      resolve([]);
+    }, CRAWL_TIMEOUT_MS)
+  );
+
+  return Promise.race([crawl(), timeout]);
 }

@@ -29,7 +29,14 @@ async function processSingleJob(job: PgBoss.JobWithMetadata<CrawlCompanyPayload>
     const pages = await crawlCompany(baseUrl);
 
     if (pages.length === 0) {
-      throw new Error(`No pages crawled for ${domain}`);
+      // Host is unreachable — mark failed immediately, no retry
+      await prisma.company.update({
+        where: { id: companyId },
+        data: { crawlStatus: 'FAILED' },
+      });
+      await updateBatchProgress(batchId);
+      console.log(`[worker] skipped ${domain} — unreachable (no pages)`);
+      return;
     }
 
     // 2. Save raw data
