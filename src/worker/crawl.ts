@@ -31,10 +31,10 @@ const JUNK_EMAIL_DOMAINS = [
   'sampleemail.com', 'mailserver.com',
 ];
 
-const FALLBACK_PATHS = ['/about', '/team', '/services', '/contact', '/contacts', '/kontakti', '/контакти', '/history'];
+const FALLBACK_PATHS = ['/about', '/team', '/services', '/contact', '/contact-us', '/contacts', '/kontakti', '/контакти', '/history'];
 
 // Pages where we must save the full HTML for structured extraction (team, services, etc.)
-const HTML_SAVE_PATHS = ['/team', '/about', '/services', '/service', '/contact', '/contacts', '/kontakti', '/history', '/people', '/staff'];
+const HTML_SAVE_PATHS = ['/team', '/about', '/services', '/service', '/contact', '/contact-us', '/contacts', '/kontakti', '/history', '/people', '/staff'];
 
 function shouldSaveHtml(url: string): boolean {
   return HTML_SAVE_PATHS.some((p) => url.includes(p));
@@ -68,8 +68,31 @@ function extractEmailsFromHtml(html: string): string[] {
   return filterEmails(found);
 }
 
+// Some sites obfuscate emails by splitting the local-part and domain across
+// sibling elements with a <br> or other tag in between, e.g.:
+//   <div>contacts@<br /></div><div>volasoftware.com</div>
+// The regex matches: localpart@ + any HTML tags/whitespace + domain.tld
+const SPLIT_EMAIL_RE = /([a-zA-Z0-9._%+\-]+@)(?:<[^>]*>\s*|\s)+([a-zA-Z0-9.\-]+\.[a-zA-Z]{2,})/g;
+
+function extractSplitEmails(html: string): string[] {
+  if (!html) return [];
+  const found: string[] = [];
+  let m: RegExpExecArray | null;
+  while ((m = SPLIT_EMAIL_RE.exec(html)) !== null) {
+    const email = m[1] + m[2];
+    EMAIL_RE.lastIndex = 0;
+    if (EMAIL_RE.test(email)) found.push(email);
+    EMAIL_RE.lastIndex = 0;
+  }
+  return filterEmails(found);
+}
+
 function mergeEmails(text: string, html: string): string[] {
-  return [...new Set([...extractEmails(text), ...extractEmailsFromHtml(html)])];
+  return [...new Set([
+    ...extractEmails(text),
+    ...extractEmailsFromHtml(html),
+    ...extractSplitEmails(html),
+  ])];
 }
 
 function extractPhones(text: string): string[] {
@@ -113,6 +136,14 @@ function makeConfig(): Configuration {
   return new Configuration({ storageClient: new MemoryStorage() });
 }
 
+// Strip <script>, <style>, and <noscript> before extracting visible text so
+// JSON-LD, inline JS, and CSS never bleed into extraction (e.g. location, emails).
+function pageText($: cheerio.CheerioAPI): string {
+  const $clean = cheerio.load($.html());
+  $clean('script, style, noscript').remove();
+  return $clean.root().text();
+}
+
 async function crawlWithCheerio(baseUrl: string): Promise<CrawledPage[]> {
   const pages: CrawledPage[] = [];
   let homepageHtml = '';
@@ -123,7 +154,7 @@ async function crawlWithCheerio(baseUrl: string): Promise<CrawledPage[]> {
       requestHandlerTimeoutSecs: 20,
       async requestHandler({ $, request, body }) {
         homepageHtml = body.toString();
-        const text = $.text();
+        const text = pageText($);
         pages.push({
           url: request.url,
           text,
@@ -153,7 +184,7 @@ async function crawlWithCheerio(baseUrl: string): Promise<CrawledPage[]> {
       requestHandlerTimeoutSecs: 10,
       navigationTimeoutSecs: 10,
       async requestHandler({ $, request }) {
-        const text = $.text();
+        const text = pageText($);
         const html = $.html();
         // Save full HTML for pages that are needed for structured extraction
         pages.push({

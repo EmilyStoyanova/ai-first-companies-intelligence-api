@@ -2,7 +2,7 @@ import ExcelJS from 'exceljs';
 import { prisma } from '../lib/prisma';
 import { StorageService } from './storage';
 
-interface TeamMember { name: string; position?: string; email?: string; }
+interface TeamMember { name: string; position?: string; email?: string; linkedin?: string; }
 
 function serializeTeam(raw: unknown): string {
   if (!raw) return '';
@@ -17,6 +17,15 @@ function serializeTeam(raw: unknown): string {
     .join('; ');
 }
 
+function serializeTeamLinkedIn(raw: unknown): string {
+  if (!raw) return '';
+  const arr: TeamMember[] = Array.isArray(raw) ? raw as TeamMember[] : [];
+  return arr
+    .map((m) => m.linkedin)
+    .filter((url): url is string => Boolean(url))
+    .join(' | ');
+}
+
 interface ExportRow {
   domain: string;
   name: string;
@@ -26,6 +35,7 @@ interface ExportRow {
   phones: string;
   services: string;
   team: string;
+  teamLinkedIn: string;
   socialLinks: string;
   completionScore: number;
   crawlStatus: string;
@@ -48,6 +58,7 @@ async function fetchRows(batchId: string, tenantId: string): Promise<ExportRow[]
     phones: Array.isArray(c.profile?.phones) ? (c.profile.phones as string[]).join(', ') : '',
     services: Array.isArray(c.profile?.services) ? (c.profile.services as string[]).join(', ') : '',
     team: serializeTeam(c.profile?.team),
+    teamLinkedIn: serializeTeamLinkedIn(c.profile?.team),
     socialLinks: c.profile?.socialLinks ? JSON.stringify(c.profile.socialLinks) : '',
     completionScore: c.profile?.completionScore ?? 0,
     crawlStatus: c.crawlStatus,
@@ -77,6 +88,7 @@ export const ExportService = {
         { header: 'Phones', key: 'phones', width: 30 },
         { header: 'Services', key: 'services', width: 50 },
         { header: 'Team', key: 'team', width: 60 },
+        { header: 'Team LinkedIn Profiles', key: 'teamLinkedIn', width: 60 },
         { header: 'Social Links', key: 'socialLinks', width: 50 },
         { header: 'Completion Score', key: 'completionScore', width: 18 },
         { header: 'Crawl Status', key: 'crawlStatus', width: 15 },
@@ -90,7 +102,7 @@ export const ExportService = {
       // CSV
       const headers = [
         'domain', 'name', 'description', 'location',
-        'emails', 'phones', 'services', 'team', 'socialLinks',
+        'emails', 'phones', 'services', 'team', 'teamLinkedIn', 'socialLinks',
         'completionScore', 'crawlStatus',
       ];
 

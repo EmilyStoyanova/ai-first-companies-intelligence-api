@@ -5,6 +5,7 @@ export interface TeamMember {
   name: string;
   position?: string;
   email?: string;
+  linkedin?: string;
 }
 
 export interface ExtractedProfile {
@@ -104,12 +105,16 @@ function extractDescription(pages: CrawledPage[]): string | undefined {
 // A line must have a STREET INDICATOR to be considered an address.
 // This prevents matching years (2022), prices, or history sentences.
 const STREET_INDICATORS = [
-  /\b(?:str|ul|bul|blvd?|nab|sq)\.\s*["«»]?\w/i,         // Latin Eastern European: ul. / str. (quotes allowed)
-  /(?:ул|бул|пл|кв|ж\.к|жк)\.\s*["«»]?\S/iu,             // Cyrillic Bulgarian: ул., бул., пл., кв., ж.к.
-  /\b(?:street|avenue|boulevard|road|drive|lane|plaza)\b/i, // Western
-  /\boffice\s+\w/i,                                         // "Office Razgrad"
-  /\b(?:address|headquarters?|hq)\s*:/i,                    // explicit label
+  /\b(?:str|ul|bul|blvd?|nab|sq)\.\s*["«»]?\w/i,           // Latin Eastern European: ul. / str. (quotes allowed)
+  /(?:ул|бул|пл|кв|ж\.к|жк)\.\s*["«»]?\S/iu,               // Cyrillic Bulgarian: ул., бул., пл., кв., ж.к.
+  /\b(?:street|avenue|boulevard|road|drive|lane|plaza)\b/i,  // Western
+  /(?<![a-zA-Z-])office\s+\d/i,                              // "Office 5" — requires digit after, avoids "back-office transformations"
+  /\b(?:address|registered\s+office|headquarters?|hq)\s*:/i, // explicit Latin label
+  /(?:адрес)\s*:/iu,                                          // explicit Cyrillic label: Адрес:
 ];
+
+// Regex to detect an address label in a line and extract the address portion after it
+const ADDRESS_LABEL_RE = /(?:адрес|address|registered\s+office)\s*:\s*(.+)/iu;
 
 // Detect CSS / style content so we never return it as an address
 function looksLikeCss(text: string): boolean {
@@ -131,14 +136,29 @@ function extractLocation(pages: CrawledPage[]): string | undefined {
   }
 
   // 2. Elements with explicit "address" in class (NOT "location" — too broad)
+  // Split raw text by newlines BEFORE collapsing whitespace so we can isolate
+  // the street line from surrounding headings/breadcrumbs in the same element.
   for (const page of pages) {
     if (!page.html) continue;
     const $ = cheerio.load(page.html);
     let found: string | undefined;
     $('[class*="address"]').each((_i, el) => {
       if (found) return;
-      const text = $(el).text().replace(/\s+/g, ' ').trim();
-      if (text.length > 8 && text.length < 300 && !looksLikeCss(text)) found = text;
+      const rawText = $(el).text();
+      // Split by newlines first, then normalise each line individually
+      const lines = rawText
+        .split(/[\n\r]+/)
+        .map((l) => l.replace(/\s+/g, ' ').trim())
+        .filter((l) => l.length > 5 && l.length < 200 && !looksLikeCss(l) && !l.includes('<'));
+      // Prefer the line that contains a street indicator
+      const streetLine = lines.find((l) => STREET_INDICATORS.some((re) => re.test(l)));
+      if (streetLine) {
+        found = streetLine.replace(/[,;]\s*$/, '');
+      } else if (lines.length > 0) {
+        // Fallback: shortest non-empty line (likely the address, not surrounding headings)
+        const shortest = lines.reduce((a, b) => (a.length <= b.length ? a : b));
+        if (shortest.length < 150) found = shortest.replace(/[,;]\s*$/, '');
+      }
     });
     if (found) return found;
   }
@@ -157,10 +177,35 @@ function extractLocation(pages: CrawledPage[]): string | undefined {
     // Must have a street indicator — this rejects "established in 2022" etc.
     if (!STREET_INDICATORS.some((re) => re.test(line))) continue;
     if (looksLikeCss(line)) continue;
-    const key = line.toLowerCase().replace(/\s/g, '');
+    // Skip lines containing raw HTML angle brackets — JSON-LD / inline script bleed
+    if (line.includes('<') || line.includes('>')) continue;
+
+    // If the line is long (legal text, footer paragraphs), try to extract just
+    // the address portion rather than the whole sentence.
+    let candidate = line;
+    const labelMatch = line.match(ADDRESS_LABEL_RE);
+    if (labelMatch) {
+      // "Адрес: Варна, бул. Генерал Колев 54" → take everything after the colon
+      candidate = labelMatch[1].trim();
+    } else if (line.length > 80) {
+      // No explicit label but long line — find where the street indicator starts
+      // and take from the last word-break before it to end of line
+      for (const re of STREET_INDICATORS) {
+        const m = line.match(new RegExp(re.source, re.flags.replace('g', '')));
+        if (m?.index !== undefined) {
+          const start = line.lastIndexOf(' ', m.index - 1) + 1;
+          candidate = line.slice(start);
+          break;
+        }
+      }
+    }
+
+    const cleaned = candidate.replace(/[,;.]\s*$/, '').trim();
+    if (cleaned.length < 5) continue;
+    const key = cleaned.toLowerCase().replace(/\s/g, '');
     if (seenKeys.has(key)) continue;
     seenKeys.add(key);
-    addresses.push(line);
+    addresses.push(cleaned);
     if (addresses.length >= 2) break;
   }
 
@@ -174,6 +219,10 @@ const SERVICE_CONTEXT_RE = /service|solution|what we (do|offer|provide|build)|ou
 
 // Stop scanning when we hit the start of a clearly different section
 const STOP_SECTION_RE  = /^(?:about\s*us?|our\s*team|meet\s*(?:our|the)\s*team|contact\s*(?:us)?|clients?|partners?|testimonials?|blog|news|portfolio|pricing|home|get\s*in\s*touch|careers?)$/i;
+
+function normalizeTitle(raw: string): string {
+  return raw.replace(/\s+/g, ' ').trim();
+}
 
 function extractServicesFromHtml(pages: CrawledPage[]): Set<string> {
   const items = new Set<string>();
@@ -189,14 +238,14 @@ function extractServicesFromHtml(pages: CrawledPage[]): Set<string> {
 
       // Adjacent <ul>/<ol>
       $(el).nextAll('ul, ol').first().find('li').each((_j, li) => {
-        const t = $(li).clone().children('ul, ol').remove().end().text().trim().split('\n')[0].trim();
+        const t = normalizeTitle($(li).clone().children('ul, ol').remove().end().text());
         if (t.length > 2 && t.length < 120) items.add(t);
       });
 
       // Cards/headings inside the nearest section/div container
       $(el).closest('section, div[class]').find('h3, h4, [class*="card"] h3, [class*="service"] h4, [class*="item"] h4').each((_j, card) => {
         if (card === el) return;
-        const t = $(card).text().trim().split('\n')[0].trim();
+        const t = normalizeTitle($(card).text());
         if (t.length > 2 && t.length < 120 && !SERVICE_CONTEXT_RE.test(t.toLowerCase())) items.add(t);
       });
     });
@@ -205,9 +254,19 @@ function extractServicesFromHtml(pages: CrawledPage[]): Set<string> {
     $('[class*="service"],[class*="solution"],[class*="offering"],[class*="capability"],[class*="feature"]').each((_i, el) => {
       // Skip the outer wrapper (it would grab the section heading)
       if ($(el).find('[class*="service"],[class*="card"],[class*="item"]').length > 2) return;
-      const title = $(el).find('h2, h3, h4, strong').first().text().trim().split('\n')[0].trim();
+      const title = normalizeTitle($(el).find('h2, h3, h4, strong').first().text());
       if (title.length > 2 && title.length < 120) items.add(title);
     });
+
+    // Strategy 3: service/item title classes — handles grid layouts where individual
+    // cards don't carry "service" in their class (e.g. item-title, service-title).
+    // Only runs when Strategies 1 & 2 found nothing, to avoid duplicate noise.
+    if (items.size === 0) {
+      $('[class*="item-title"],[class*="service-title"],[class*="card-title"],[class*="tile-title"]').each((_i, el) => {
+        const t = normalizeTitle($(el).text());
+        if (t.length > 2 && t.length < 120 && !SERVICE_CONTEXT_RE.test(t.toLowerCase())) items.add(t);
+      });
+    }
   }
 
   return items;
@@ -236,7 +295,7 @@ function extractServicesFromText(pages: CrawledPage[]): string[] {
       if (/[.!?]$/.test(line)) continue;
       if (/^\d+$/.test(line)) continue;
       // Skip lines that look like nav links or generic words
-      if (/^(?:home|contact|about|blog|login|sign\s*in|read\s*more|learn\s*more|get\s*started)$/i.test(line)) continue;
+      if (/^(?:home|contact|about|company|team|people|staff|blog|login|sign\s*in|read\s*more|learn\s*more|get\s*started|careers?|portfolio)$/i.test(line)) continue;
 
       items.push(line);
       if (items.length >= 15) break;
@@ -270,6 +329,20 @@ const TEAM_CARD_SELECTORS = [
 const NAME_SELECTORS   = 'h2, h3, h4, [class*="name"], strong';
 const ROLE_SELECTORS   = 'p, span, [class*="role"], [class*="title"], [class*="position"], [class*="job"], em, small';
 const EMAIL_RE_LOCAL   = /[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}/;
+// Individual LinkedIn profile URLs — linkedin.com/in/<slug>
+const LINKEDIN_PROFILE_RE = /https?:\/\/(?:www\.)?linkedin\.com\/in\/[^\s"'<>?#]+/i;
+
+function extractLinkedIn($el: cheerio.Cheerio<cheerio.Element>, $: cheerio.CheerioAPI): string | undefined {
+  // First check hrefs of <a> tags inside the card
+  let url: string | undefined;
+  $el.find('a[href*="linkedin.com/in/"]').each((_i, a) => {
+    if (url) return;
+    const href = $(a).attr('href') ?? '';
+    const m = href.match(LINKEDIN_PROFILE_RE);
+    if (m) url = m[0].replace(/\/$/, ''); // strip trailing slash
+  });
+  return url;
+}
 
 function extractTeam(pages: CrawledPage[]): TeamMember[] {
   const members: TeamMember[] = [];
@@ -293,9 +366,10 @@ function extractTeam(pages: CrawledPage[]): TeamMember[] {
         const rawRole = $card.find(ROLE_SELECTORS).first().text().trim().split('\n')[0].trim();
         const position = rawRole && rawRole !== name && rawRole.length < 100 ? rawRole : undefined;
         const emailMatch = $card.text().match(EMAIL_RE_LOCAL);
+        const linkedin = extractLinkedIn($card, $);
 
         seen.add(name.toLowerCase());
-        members.push({ name, position, email: emailMatch?.[0] });
+        members.push({ name, position, email: emailMatch?.[0], linkedin });
       });
 
       if (members.length > 0) break; // found cards, don't try next selector
