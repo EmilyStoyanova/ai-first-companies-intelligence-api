@@ -19,7 +19,50 @@ B2B Data Enrichment Engine — upload a list of company domains, crawl their web
 | Docs | Swagger UI |
 | Email | Nodemailer (console fallback in dev) |
 
-## Getting Started
+## Running with Docker (recommended)
+
+The easiest way to run the full stack. Requires [Docker Desktop](https://www.docker.com/products/docker-desktop/).
+
+### 1. Get the files
+
+Two files are needed:
+- `docker-compose.yml`
+- `.env` 
+
+### 2. Start the stack
+
+```bash
+docker-compose up -d
+```
+
+Docker pulls the images automatically — no code or build required.
+
+### 3. First run only — apply database migrations
+
+```bash
+docker-compose exec api npx prisma migrate deploy
+docker-compose exec api npx prisma db push
+```
+
+### 4. Open the app
+
+| Service | URL |
+|---------|-----|
+| Frontend | http://localhost:3000 |
+| API | http://localhost:3001 |
+| Swagger UI | http://localhost:3001/docs |
+
+### Day-to-day commands
+
+```bash
+docker-compose up -d    # start
+docker-compose down     # stop
+docker-compose logs -f  # view logs
+```
+
+---
+
+## Local Development
 
 ### 1. Install dependencies
 
