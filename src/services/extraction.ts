@@ -332,10 +332,11 @@ const EMAIL_RE_LOCAL   = /[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}/;
 // Individual LinkedIn profile URLs — linkedin.com/in/<slug>
 const LINKEDIN_PROFILE_RE = /https?:\/\/(?:www\.)?linkedin\.com\/in\/[^\s"'<>?#]+/i;
 
-function extractLinkedIn($el: cheerio.Cheerio<cheerio.Element>, $: cheerio.CheerioAPI): string | undefined {
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+function extractLinkedIn($el: any, $: cheerio.CheerioAPI): string | undefined {
   // First check hrefs of <a> tags inside the card
   let url: string | undefined;
-  $el.find('a[href*="linkedin.com/in/"]').each((_i, a) => {
+  $el.find('a[href*="linkedin.com/in/"]').each((_i: number, a: any) => {
     if (url) return;
     const href = $(a).attr('href') ?? '';
     const m = href.match(LINKEDIN_PROFILE_RE);

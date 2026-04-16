@@ -154,7 +154,7 @@ async function crawlWithCheerio(baseUrl: string): Promise<CrawledPage[]> {
       requestHandlerTimeoutSecs: 20,
       async requestHandler({ $, request, body }) {
         homepageHtml = body.toString();
-        const text = pageText($);
+        const text = pageText($ as unknown as cheerio.CheerioAPI);
         pages.push({
           url: request.url,
           text,
@@ -184,7 +184,7 @@ async function crawlWithCheerio(baseUrl: string): Promise<CrawledPage[]> {
       requestHandlerTimeoutSecs: 10,
       navigationTimeoutSecs: 10,
       async requestHandler({ $, request }) {
-        const text = pageText($);
+        const text = pageText($ as unknown as cheerio.CheerioAPI);
         const html = $.html();
         // Save full HTML for pages that are needed for structured extraction
         pages.push({
