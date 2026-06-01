@@ -1,0 +1,57 @@
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: companies_intelligence
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    restart: unless-stopped
+
+  api:
+    build:
+      context: ./ai-first-companies-intelligence-api
+    image: ludogoriesoft/companies-intelligence-api:latest
+    ports:
+      - "3001:3001"
+    env_file:
+      - .env
+    environment:
+      # Override host: Prisma in containers must use the Compose service name `db`, not `localhost`.
+      DATABASE_URL: "postgresql://postgres:${POSTGRES_PASSWORD}@db:5432/companies_intelligence"
+    depends_on:
+      - db
+    restart: unless-stopped
+
+  worker:
+    image: ludogoriesoft/companies-intelligence-api:latest
+    command: ["node", "dist/worker/index.js"]
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: "postgresql://postgres:${POSTGRES_PASSWORD}@db:5432/companies_intelligence"
+    depends_on:
+      - api
+      - db
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: ./-ai-first-companies-intelligence-fe
+      args:
+        NEXT_PUBLIC_API_URL: http://localhost:3001/api
+        API_INTERNAL_URL: http://api:3001/api
+    image: ludogoriesoft/companies-intelligence-frontend:latest
+    ports:
+      - "3000:3000"
+    environment:
+      API_INTERNAL_URL: http://api:3001/api
+    depends_on:
+      - api
+    restart: unless-stopped
+
+volumes:
+  postgres_data:
