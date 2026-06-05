@@ -1,8 +1,9 @@
 import PgBoss from 'pg-boss';
 
 export const QUEUES = {
-  CRAWL_COMPANY: 'crawl-company',
-  DISCOVER_PERSONA: 'discover-persona',
+  CRAWL_COMPANY:       'crawl-company',
+  DISCOVER_PERSONA:    'discover-persona',
+  PERSONALIZE_COMPANY: 'personalize-company',
 } as const;
 
 export interface CrawlCompanyPayload {
@@ -20,6 +21,10 @@ export interface DiscoverPersonaPayload {
   location: string;
   keywords?: string;
   maxResults?: number;
+}
+
+export interface PersonalizeCompanyPayload {
+  companyId: string;
 }
 
 let boss: PgBoss | null = null;
@@ -41,6 +46,7 @@ export async function getQueue(): Promise<PgBoss> {
   // pg-boss v10 requires queues to be created before sending
   await boss.createQueue(QUEUES.CRAWL_COMPANY);
   await boss.createQueue(QUEUES.DISCOVER_PERSONA);
+  await boss.createQueue(QUEUES.PERSONALIZE_COMPANY);
 
   console.log('[pg-boss] started');
   return boss;
@@ -65,6 +71,17 @@ export async function enqueueDiscoverJob(
     retryLimit: 2,
     retryDelay: 30,
     retryBackoff: false,
+  });
+}
+
+export async function enqueuePersonalizeJob(
+  payload: PersonalizeCompanyPayload,
+  queue: PgBoss
+): Promise<void> {
+  await queue.send(QUEUES.PERSONALIZE_COMPANY, payload as unknown as object, {
+    retryLimit: 2,
+    retryDelay: 30,
+    retryBackoff: true,
   });
 }
 

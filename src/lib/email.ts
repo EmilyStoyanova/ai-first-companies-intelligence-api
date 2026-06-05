@@ -1,6 +1,34 @@
 import nodemailer from 'nodemailer';
 
-function createTransport() {
+export function logSmtpConfig(): void {
+  const host = process.env.EMAIL_HOST;
+  const user = process.env.EMAIL_USER;
+  const pass = process.env.EMAIL_PASS;
+  const port = process.env.EMAIL_PORT || '587';
+  const secure = process.env.EMAIL_SECURE || 'false';
+
+  if (!host) {
+    console.warn('[email] WARNING: EMAIL_HOST is not set — email delivery disabled.');
+    console.warn('[email]   Running in console (dev) mode. Set EMAIL_HOST + EMAIL_USER + EMAIL_PASS to enable.');
+    console.warn('[email]   Gmail: EMAIL_HOST=smtp.gmail.com  EMAIL_PORT=587  EMAIL_SECURE=false');
+    return;
+  }
+
+  const maskedUser = user
+    ? `${user.slice(0, 3)}***${user.includes('@') ? '@' + user.split('@')[1] : ''}`
+    : '(not set)';
+
+  console.log('[email] SMTP configured:');
+  console.log(`[email]   HOST=${host}  PORT=${port}  SECURE=${secure}`);
+  console.log(`[email]   USER=${maskedUser}`);
+  console.log(`[email]   PASS=${pass ? '*** (set)' : '(NOT SET — delivery will fail)'}`);
+
+  if (host === 'smtp.gmail.com' && pass && pass.includes(' ')) {
+    console.warn('[email]   WARNING: EMAIL_PASS contains spaces — Gmail App Passwords must have spaces removed.');
+  }
+}
+
+function createTransport(): nodemailer.Transporter | null {
   if (!process.env.EMAIL_HOST) return null;
 
   return nodemailer.createTransport({
@@ -53,17 +81,30 @@ export async function sendConfirmationEmail(email: string, token: string): Promi
   const transporter = createTransport();
 
   if (!transporter) {
-    console.log('\n📧 [EMAIL - DEV MODE — set EMAIL_HOST to send real emails]');
-    console.log(`   To: ${email}`);
-    console.log(`   Confirm URL: ${confirmUrl}\n`);
+    console.log('[email] DEV MODE — printing verification URL to console (EMAIL_HOST not configured):');
+    console.log(`[email]   To: ${email}`);
+    console.log(`[email]   Confirm URL: ${confirmUrl}`);
     return;
   }
 
-  await transporter.sendMail({
-    from,
-    to: email,
-    subject: 'Confirm your Companies Intelligence account',
-    text: `Confirm your email address by visiting: ${confirmUrl}`,
-    html,
-  });
+  console.log(`[email] Sending confirmation to ${email} via ${process.env.EMAIL_HOST}...`);
+
+  try {
+    const info = await transporter.sendMail({
+      from,
+      to: email,
+      subject: 'Confirm your Companies Intelligence account',
+      text: `Confirm your email address by visiting: ${confirmUrl}`,
+      html,
+    });
+    console.log(`[email] Delivered to ${email} — messageId: ${info.messageId}`);
+  } catch (err) {
+    const e = err as Error & { code?: string; responseCode?: number; command?: string };
+    console.error(`[email] SMTP delivery FAILED to ${email}:`);
+    console.error(`[email]   ${e.message}`);
+    if (e.code) console.error(`[email]   code: ${e.code}`);
+    if (e.responseCode) console.error(`[email]   smtp_response: ${e.responseCode}`);
+    if (e.command) console.error(`[email]   at_command: ${e.command}`);
+    throw err;
+  }
 }

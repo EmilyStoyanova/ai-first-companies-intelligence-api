@@ -72,7 +72,7 @@ router.post('/register', async (req: Request, res: Response): Promise<void> => {
   });
 
   const token = jwt.sign(
-    { sub: user.id, tenantId: tenant.id, email: user.email },
+    { sub: user.id, tenantId: tenant.id, email: user.email, emailVerified: user.emailVerified },
     process.env.JWT_SECRET!,
     { expiresIn: '7d' }
   );
@@ -129,7 +129,7 @@ router.post('/login', async (req: Request, res: Response): Promise<void> => {
   }
 
   const token = jwt.sign(
-    { sub: user.id, tenantId: user.tenantId, email: user.email },
+    { sub: user.id, tenantId: user.tenantId, email: user.email, emailVerified: user.emailVerified },
     process.env.JWT_SECRET!,
     { expiresIn: '7d' }
   );
@@ -159,29 +159,39 @@ router.post('/login', async (req: Request, res: Response): Promise<void> => {
  */
 router.get('/confirm-email', async (req: Request, res: Response): Promise<void> => {
   const { token } = req.query;
+  const frontendUrl = process.env.FRONTEND_URL || 'http://localhost:3000';
 
   if (!token || typeof token !== 'string') {
-    res.redirect('http://localhost:3000/dashboard?error=invalid_token');
+    res.redirect(`${frontendUrl}/dashboard?error=invalid_token`);
     return;
   }
 
   try {
-    const user = await prisma.user.findFirst({ where: { emailVerificationToken: token } });
+    const found = await prisma.user.findFirst({ where: { emailVerificationToken: token } });
 
-    if (!user) {
-      res.redirect('http://localhost:3000/dashboard?error=invalid_token');
+    if (!found) {
+      res.redirect(`${frontendUrl}/dashboard?error=invalid_token`);
       return;
     }
 
-    await prisma.user.update({
-      where: { id: user.id },
+    const user = await prisma.user.update({
+      where: { id: found.id },
       data: { emailVerified: true, emailVerificationToken: null },
     });
 
-    res.redirect('http://localhost:3000/dashboard?verified=true');
+    // Issue a fresh JWT so the browser session immediately reflects emailVerified=true.
+    // Without this the stored token (minted at register/login) would retain emailVerified:false
+    // and requireVerified would block uploads until the user manually re-logged in.
+    const freshToken = jwt.sign(
+      { sub: user.id, tenantId: user.tenantId, email: user.email, emailVerified: true },
+      process.env.JWT_SECRET!,
+      { expiresIn: '7d' }
+    );
+
+    res.redirect(`${frontendUrl}/dashboard?verified=true&token=${freshToken}`);
   } catch (err) {
     console.error('[auth/confirm-email]', err);
-    res.redirect('http://localhost:3000/dashboard?error=server_error');
+    res.redirect(`${frontendUrl}/dashboard?error=server_error`);
   }
 });
 

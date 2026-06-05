@@ -41,9 +41,10 @@ model Company {
   crawlStatus   CrawlStatus @default(PENDING)
   createdAt     DateTime  @default(now())
 
-  tenantCompanies   TenantCompany[]
-  rawProfiles       RawCompanyProfile[]
-  profile           CompanyProfile?
+  tenantCompanies     TenantCompany[]
+  rawProfiles         RawCompanyProfile[]
+  profile             CompanyProfile?
+  personalizedContent PersonalizedContent?
 }
 
 model TenantCompany {
@@ -105,6 +106,18 @@ model CompanyProfile {
   socialLinks     Json     @default("{}")
   completionScore Float    @default(0)
   updatedAt       DateTime @updatedAt
+
+  company Company @relation(fields: [companyId], references: [id])
+}
+
+model PersonalizedContent {
+  id               String   @id @default(uuid())
+  companyId        String   @unique
+  emailSubject     String?
+  openingLine      String?
+  valueProposition String?
+  fullMessage      String?
+  generatedAt      DateTime @default(now())
 
   company Company @relation(fields: [companyId], references: [id])
 }

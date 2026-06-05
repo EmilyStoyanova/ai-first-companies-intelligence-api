@@ -1,9 +1,10 @@
 import 'dotenv/config';
-import { getQueue, QUEUES, CrawlCompanyPayload, DiscoverPersonaPayload, enqueueCrawlJob, stopQueue } from '../lib/queue';
+import { getQueue, QUEUES, CrawlCompanyPayload, DiscoverPersonaPayload, PersonalizeCompanyPayload, enqueueCrawlJob, enqueuePersonalizeJob, stopQueue } from '../lib/queue';
 import { prisma } from '../lib/prisma';
 import { crawlCompany } from './crawl';
 import { extractProfile } from '../services/extraction';
 import { discoverSites } from '../services/discovery';
+import { generatePersonalizedContent } from '../services/personalization';
 import PgBoss from 'pg-boss';
 
 const CONCURRENCY = parseInt(process.env.WORKER_CONCURRENCY || '5', 10);
@@ -91,14 +92,20 @@ async function processSingleJob(job: PgBoss.JobWithMetadata<CrawlCompanyPayload>
 
     console.log(`[worker] done ${domain} — score: ${profile.completionScore}`);
     await updateBatchProgress(batchId);
+
+    // 6. Enqueue personalization — separate queue with lower concurrency for Groq rate limits
+    const pQueue = await getQueue();
+    await enqueuePersonalizeJob({ companyId }, pQueue);
   } catch (err) {
     console.error(`[worker] failed ${domain}:`, err);
 
     const retryLimit = 3;
     const isFinalAttempt = (job.retryCount ?? 0) >= retryLimit - 1;
 
-    await prisma.company.update({
-      where: { id: companyId },
+    // Use updateMany with a guard so a stale/concurrent retry job never downgrades
+    // a company that was already successfully completed by a parallel job.
+    await prisma.company.updateMany({
+      where: { id: companyId, crawlStatus: { not: 'COMPLETED' } },
       data: { crawlStatus: isFinalAttempt ? 'FAILED' : 'PENDING' },
     });
 
@@ -113,11 +120,22 @@ async function processSingleJob(job: PgBoss.JobWithMetadata<CrawlCompanyPayload>
 
 async function updateBatchProgress(batchId: string): Promise<void> {
   // Atomic increment — avoids read-modify-write race with concurrent workers
-  const batch = await prisma.crawlBatch.update({
-    where: { id: batchId },
-    data: { processedCompanies: { increment: 1 } },
-    select: { totalCompanies: true, processedCompanies: true },
-  });
+  let batch: { totalCompanies: number; processedCompanies: number };
+  try {
+    batch = await prisma.crawlBatch.update({
+      where: { id: batchId },
+      data: { processedCompanies: { increment: 1 } },
+      select: { totalCompanies: true, processedCompanies: true },
+    });
+  } catch (err: unknown) {
+    // Batch was deleted or never existed — skip progress update silently.
+    // A missing batch must not propagate as a crawl failure.
+    if ((err as { code?: string }).code === 'P2025') {
+      console.warn(`[worker] batch ${batchId} not found; skipping progress update`);
+      return;
+    }
+    throw err;
+  }
 
   const percentage = batch.totalCompanies > 0
     ? (batch.processedCompanies / batch.totalCompanies) * 100
@@ -212,6 +230,38 @@ async function processDiscoverJob(
   }
 }
 
+async function processPersonalizeJob(
+  job: PgBoss.JobWithMetadata<PersonalizeCompanyPayload>
+): Promise<void> {
+  const { companyId } = job.data;
+
+  const profile = await prisma.companyProfile.findUnique({ where: { companyId } });
+  if (!profile) {
+    console.log(`[worker/personalize] No profile for ${companyId} — skipping`);
+    return;
+  }
+
+  const result = await generatePersonalizedContent({
+    name:        profile.name        ?? undefined,
+    description: profile.description ?? undefined,
+    location:    profile.location    ?? undefined,
+    services:    Array.isArray(profile.services) ? (profile.services as string[])                             : [],
+    team:        Array.isArray(profile.team)     ? (profile.team as Array<{ name: string; position?: string }>) : [],
+    history:     profile.history     ?? undefined,
+    emails:      Array.isArray(profile.emails)   ? (profile.emails as string[])                               : [],
+  });
+
+  if (!result) return;
+
+  await prisma.personalizedContent.upsert({
+    where:  { companyId },
+    create: { companyId, ...result },
+    update: result,
+  });
+
+  console.log(`[worker/personalize] Saved content for ${companyId}`);
+}
+
 async function main(): Promise<void> {
   console.log('[worker] starting...');
   const queue = await getQueue();
@@ -230,7 +280,15 @@ async function main(): Promise<void> {
     }
   );
 
-  console.log(`[worker] listening on queues "${QUEUES.CRAWL_COMPANY}", "${QUEUES.DISCOVER_PERSONA}" (concurrency: ${CONCURRENCY})`);
+  queue.work<PersonalizeCompanyPayload>(
+    QUEUES.PERSONALIZE_COMPANY,
+    { batchSize: 2, includeMetadata: true },
+    async (jobs) => {
+      for (const job of jobs) await processPersonalizeJob(job);
+    }
+  );
+
+  console.log(`[worker] listening on queues "${QUEUES.CRAWL_COMPANY}", "${QUEUES.DISCOVER_PERSONA}", "${QUEUES.PERSONALIZE_COMPANY}" (concurrency: ${CONCURRENCY})`);
 
   // Graceful shutdown
   const shutdown = async (signal: string) => {

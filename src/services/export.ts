@@ -39,6 +39,8 @@ interface ExportRow {
   socialLinks: string;
   completionScore: number;
   crawlStatus: string;
+  emailSubject: string;
+  outreachMessage: string;
 }
 
 async function fetchRows(batchId: string, tenantId: string): Promise<ExportRow[]> {
@@ -46,7 +48,7 @@ async function fetchRows(batchId: string, tenantId: string): Promise<ExportRow[]
     where: {
       tenantCompanies: { some: { tenantId, sourceBatchId: batchId, excluded: false } },
     },
-    include: { profile: true },
+    include: { profile: true, personalizedContent: true },
   });
 
   return companies.map((c) => ({
@@ -62,6 +64,8 @@ async function fetchRows(batchId: string, tenantId: string): Promise<ExportRow[]
     socialLinks: c.profile?.socialLinks ? JSON.stringify(c.profile.socialLinks) : '',
     completionScore: c.profile?.completionScore ?? 0,
     crawlStatus: c.crawlStatus,
+    emailSubject:    c.personalizedContent?.emailSubject    ?? '',
+    outreachMessage: c.personalizedContent?.fullMessage     ?? '',
   }));
 }
 
@@ -80,18 +84,20 @@ export const ExportService = {
       const sheet = workbook.addWorksheet('Companies');
 
       sheet.columns = [
-        { header: 'Domain', key: 'domain', width: 30 },
-        { header: 'Name', key: 'name', width: 30 },
-        { header: 'Description', key: 'description', width: 50 },
-        { header: 'Location', key: 'location', width: 25 },
-        { header: 'Emails', key: 'emails', width: 40 },
-        { header: 'Phones', key: 'phones', width: 30 },
-        { header: 'Services', key: 'services', width: 50 },
-        { header: 'Team', key: 'team', width: 60 },
-        { header: 'Team LinkedIn Profiles', key: 'teamLinkedIn', width: 60 },
-        { header: 'Social Links', key: 'socialLinks', width: 50 },
-        { header: 'Completion Score', key: 'completionScore', width: 18 },
-        { header: 'Crawl Status', key: 'crawlStatus', width: 15 },
+        { header: 'Domain',                key: 'domain',          width: 30 },
+        { header: 'Name',                  key: 'name',            width: 30 },
+        { header: 'Description',           key: 'description',     width: 50 },
+        { header: 'Location',              key: 'location',        width: 25 },
+        { header: 'Emails',                key: 'emails',          width: 40 },
+        { header: 'Phones',                key: 'phones',          width: 30 },
+        { header: 'Services',              key: 'services',        width: 50 },
+        { header: 'Team',                  key: 'team',            width: 60 },
+        { header: 'Team LinkedIn Profiles',key: 'teamLinkedIn',    width: 60 },
+        { header: 'Social Links',          key: 'socialLinks',     width: 50 },
+        { header: 'Completion Score',      key: 'completionScore', width: 18 },
+        { header: 'Crawl Status',          key: 'crawlStatus',     width: 15 },
+        { header: 'Email Subject',         key: 'emailSubject',    width: 50 },
+        { header: 'Outreach Message',      key: 'outreachMessage', width: 80 },
       ];
 
       sheet.addRows(rows);
@@ -104,6 +110,7 @@ export const ExportService = {
         'domain', 'name', 'description', 'location',
         'emails', 'phones', 'services', 'team', 'teamLinkedIn', 'socialLinks',
         'completionScore', 'crawlStatus',
+        'emailSubject', 'outreachMessage',
       ];
 
       const escape = (v: string | number) => {

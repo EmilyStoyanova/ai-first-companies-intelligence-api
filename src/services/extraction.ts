@@ -105,7 +105,8 @@ function extractDescription(pages: CrawledPage[]): string | undefined {
 // A line must have a STREET INDICATOR to be considered an address.
 // This prevents matching years (2022), prices, or history sentences.
 const STREET_INDICATORS = [
-  /\b(?:str|ul|bul|blvd?|nab|sq)\.\s*["«»]?\w/i,           // Latin Eastern European: ul. / str. (quotes allowed)
+  /\b(?:str|ul|bul|blvd?|nab)\.\s*["«»]?\w/i,              // Latin Eastern European: ul. / str. (quotes allowed)
+  /\bsq\.\s*(?!(?:m|ft|in|km)(?:[.\s]|$))["«»]?\w/i,       // sq. (square) — exclude sq.m./sq.ft./sq.in. area units
   /(?:ул|бул|пл|кв|ж\.к|жк)\.\s*["«»]?\S/iu,               // Cyrillic Bulgarian: ул., бул., пл., кв., ж.к.
   /\b(?:street|avenue|boulevard|road|drive|lane|plaza)\b/i,  // Western
   /(?<![a-zA-Z-])office\s+\d/i,                              // "Office 5" — requires digit after, avoids "back-office transformations"
@@ -394,6 +395,45 @@ function extractTeam(pages: CrawledPage[]): TeamMember[] {
           seen.add(name.toLowerCase());
           members.push({ name, position });
         });
+      });
+    }
+
+    // Strategy 3: page-builder layouts (WPBakery, Elementor, Divi) where names are
+    // rendered as bold <p> elements rather than headings.  Only activates when a
+    // "meet / team / management" section heading is present on the page.
+    if (members.length === 0) {
+      // Require at least one team-section heading on this page before scanning
+      const hasTeamSection = $('h1, h2, h3').toArray().some(
+        (el) => /(?:meet|team|management|staff|people)/i.test($(el).text()),
+      );
+      if (!hasTeamSection) continue; // skip to next page
+
+      // Person names are rendered as bold <p> with inline font-weight style.
+      // Validate the text looks like a real name (2+ capitalised words, no digits).
+      // eslint-disable-next-line no-misleading-character-class
+      const FULL_NAME_RE = /^[\p{Lu}][\p{Ll}]+(?:\s[\p{Lu}][\p{Ll}]+)+$/u;
+
+      $('p[style]').each((_i, el) => {
+        const style = $(el).attr('style') ?? '';
+        if (!/font-weight\s*:\s*(?:bold|[6-9]\d\d)/i.test(style)) return;
+
+        const text = $(el).text().trim().replace(/\s+/g, ' ');
+        if (!FULL_NAME_RE.test(text)) return; // must look like "First Last"
+        if (seen.has(text.toLowerCase())) return;
+
+        seen.add(text.toLowerCase());
+
+        // Position: next sibling <p> (the role paragraph in WPBakery)
+        const $next = $(el).next('p');
+        const rawRole = $next.text().trim().split('\n')[0].trim().replace(/\s+/g, ' ');
+        const position =
+          rawRole && rawRole !== text && rawRole.length < 100 && !FULL_NAME_RE.test(rawRole)
+            ? rawRole
+            : undefined;
+
+        const emailMatch = $(el).closest('div').text().match(EMAIL_RE_LOCAL);
+
+        members.push({ name: text, position, email: emailMatch?.[0] });
       });
     }
   }

@@ -125,8 +125,15 @@ function extractNavLinks($: cheerio.CheerioAPI, baseUrl: string): string[] {
     const href = $(el).attr('href');
     if (!href) return;
     try {
-      const abs = new URL(href, baseUrl).href;
-      if (abs.startsWith(baseUrl)) links.push(abs);
+      const parsed = new URL(href, baseUrl);
+      if (!parsed.href.startsWith(baseUrl)) return;
+      // Skip language-variant query strings (?lang=xx) — they waste crawl slots
+      if (parsed.searchParams.has('lang')) return;
+      // Strip fragments; skip if what remains is just the base URL
+      parsed.hash = '';
+      const clean = parsed.href;
+      if (clean === baseUrl || clean === baseUrl + '/') return;
+      links.push(clean);
     } catch { /* ignore */ }
   });
   return [...new Set(links)].slice(0, 10);

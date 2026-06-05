@@ -1,7 +1,7 @@
 import { Router, Request, Response } from 'express';
 import { prisma } from '../../lib/prisma';
 import { getQueue, enqueueDiscoverJob } from '../../lib/queue';
-import { requireAuth } from '../../middleware/auth';
+import { requireAuth, requireVerified } from '../../middleware/auth';
 
 const router = Router();
 
@@ -48,7 +48,7 @@ const router = Router();
  *       429:
  *         description: Weekly quota exceeded
  */
-router.post('/', requireAuth, async (req: Request, res: Response): Promise<void> => {
+router.post('/', requireAuth, requireVerified, async (req: Request, res: Response): Promise<void> => {
   const { persona, location, keywords, maxResults: rawMax } = req.body as {
     persona?: string;
     location?: string;

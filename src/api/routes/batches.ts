@@ -1,4 +1,4 @@
-import { Router, Request, Response } from 'express';
+import { Router, Request, Response, NextFunction } from 'express';
 import multer from 'multer';
 import path from 'path';
 import * as XLSX from 'xlsx';
@@ -7,12 +7,32 @@ import fs from 'fs';
 import { prisma } from '../../lib/prisma';
 import { StorageService } from '../../services/storage';
 import { getQueue, enqueueCrawlJob } from '../../lib/queue';
-import { requireAuth } from '../../middleware/auth';
+import { requireAuth, requireVerified } from '../../middleware/auth';
 import { ExportService } from '../../services/export';
 
 const router = Router();
 
-const upload = multer({ dest: '/tmp/uploads/' });
+const MAX_FILE_SIZE = 5 * 1024 * 1024; // 5 MB
+const upload = multer({ dest: '/tmp/uploads/', limits: { fileSize: MAX_FILE_SIZE } });
+
+// Wrap multer so file-size errors return a clean 400 instead of crashing the request.
+function uploadSingle(req: Request, res: Response, next: NextFunction): void {
+  upload.single('file')(req, res, (err: unknown) => {
+    if (err instanceof multer.MulterError && err.code === 'LIMIT_FILE_SIZE') {
+      res.status(400).json({ error: 'Uploaded file exceeds maximum size of 5 MB' });
+      return;
+    }
+    if (err) { next(err); return; }
+    next();
+  });
+}
+
+function sanitizeFilename(original: string): string {
+  // Strip any directory components the client may have included, then replace
+  // every character that is not alphanumeric / dot / underscore / hyphen.
+  const base = path.basename(original);
+  return base.replace(/[^a-zA-Z0-9._-]/g, '_') || 'upload';
+}
 
 function normalizeDomain(raw: string): string {
   let d = raw.trim().toLowerCase();
@@ -26,10 +46,23 @@ function buildBaseUrl(domain: string): string {
   return `https://${domain}`;
 }
 
-const HEADER_WORDS = new Set(['domain', 'url', 'website', 'company', 'name', 'link']);
+const HEADER_WORDS = new Set([
+  // English
+  'domain', 'url', 'website', 'company', 'name', 'link',
+  // Bulgarian
+  'домейн', 'уебсайт', 'фирма', 'компания', 'връзка', 'сайт',
+  'ime na firmata', 'ime', 'firmata',
+]);
 
 function isHeaderValue(value: string): boolean {
   return HEADER_WORDS.has(value.trim().toLowerCase());
+}
+
+function isValidDomain(domain: string): boolean {
+  if (!domain) return false;
+  if (/\s/.test(domain)) return false;   // spaces → company name, not a domain
+  if (!domain.includes('.')) return false; // no TLD separator → not a domain
+  return true;
 }
 
 function parseFile(filePath: string, ext: string): string[] {
@@ -117,7 +150,8 @@ router.get('/', requireAuth, async (req: Request, res: Response): Promise<void> 
 router.post(
   '/upload',
   requireAuth,
-  upload.single('file'),
+  requireVerified,
+  uploadSingle,
   async (req: Request, res: Response): Promise<void> => {
     const tenantId = req.user.tenantId;
     const forceRecrawl = req.query.force_recrawl === 'true';
@@ -136,10 +170,15 @@ router.post(
     try {
       // Parse raw domains from file
       const rawValues = parseFile(req.file.path, ext);
-      const domains = [...new Set(rawValues.map(normalizeDomain).filter(Boolean))];
+      const normalized = rawValues.map(normalizeDomain).filter(Boolean);
+      const domains = [...new Set(normalized.filter(isValidDomain))];
+      const invalidRows = normalized.length - domains.length;
 
       if (domains.length === 0) {
-        res.status(400).json({ error: 'No valid domains found in file' });
+        res.status(400).json({
+          error: 'No valid domains found in file. Each row must contain a domain (e.g. example.com), not a company name.',
+          invalidRows,
+        });
         return;
       }
 
@@ -169,7 +208,7 @@ router.post(
       // Save uploaded file
       const storedPath = StorageService.upload(
         `uploads/${tenantId}`,
-        `${Date.now()}-${req.file.originalname}`,
+        `${Date.now()}-${sanitizeFilename(req.file.originalname)}`,
         req.file.path
       );
 
@@ -249,6 +288,7 @@ router.post(
         totalCompanies: domains.length,
         jobsEnqueued,
         skipped: domains.length - jobsEnqueued,
+        invalidRows,
       });
     } catch (err) {
       console.error('[batches/upload]', err);
@@ -373,7 +413,7 @@ router.get('/:id/companies', requireAuth, async (req: Request, res: Response): P
         where: {
           tenantCompanies: { some: { tenantId, sourceBatchId: id, excluded: false } },
         },
-        include: { profile: true },
+        include: { profile: true, personalizedContent: true },
         skip,
         take: limit,
         orderBy: { createdAt: 'asc' },
@@ -381,7 +421,10 @@ router.get('/:id/companies', requireAuth, async (req: Request, res: Response): P
     ]);
 
     res.json({
-      data: companies,
+      data: companies.map(({ personalizedContent, ...rest }) => ({
+        ...rest,
+        personalizedContents: personalizedContent ? [personalizedContent] : [],
+      })),
       pagination: { page, limit, total, pages: Math.ceil(total / limit) },
     });
   } catch (err) {
@@ -571,6 +614,85 @@ router.patch('/:id/candidates/:domain', requireAuth, async (req: Request, res: R
     }
   } catch (err) {
     console.error('[batches/:id/candidates/:domain]', err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+/**
+ * @openapi
+ * /api/batches/{id}/re-enrich:
+ *   post:
+ *     summary: Re-crawl, re-extract, and re-personalize all companies in a batch
+ *     description: Resets batch progress and enqueues crawl jobs for every company in the batch, bypassing the 30-day deduplication cache. The worker automatically generates PersonalizedContent after each successful crawl.
+ *     tags: [Batches]
+ *     parameters:
+ *       - in: path
+ *         name: id
+ *         required: true
+ *         schema:
+ *           type: string
+ *     responses:
+ *       200:
+ *         description: Re-enrichment started
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 batchId: { type: string }
+ *                 reEnqueuedCompanies: { type: integer }
+ *                 status: { type: string }
+ *       404:
+ *         description: Batch not found
+ */
+// POST /batches/:id/re-enrich
+router.post('/:id/re-enrich', requireAuth, requireVerified, async (req: Request, res: Response): Promise<void> => {
+  const id = String(req.params.id);
+  const tenantId = req.user.tenantId;
+
+  try {
+    const batch = await prisma.crawlBatch.findFirst({ where: { id, tenantId } });
+    if (!batch) {
+      res.status(404).json({ error: 'Batch not found' });
+      return;
+    }
+
+    const companies = await prisma.company.findMany({
+      where: {
+        tenantCompanies: { some: { tenantId, sourceBatchId: id, excluded: false } },
+      },
+      select: { id: true, domain: true, baseUrl: true },
+    });
+
+    if (companies.length === 0) {
+      res.json({ batchId: id, reEnqueuedCompanies: 0, status: batch.status });
+      return;
+    }
+
+    // Reset batch progress — all companies will be re-crawled
+    await prisma.crawlBatch.update({
+      where: { id },
+      data: {
+        processedCompanies:   0,
+        completionPercentage: 0,
+        totalCompanies:       companies.length,
+        status:               'PROCESSING',
+      },
+    });
+
+    // Enqueue crawl jobs directly — bypasses the 30-day deduplication check
+    // that lives only in the upload route, not in the worker
+    const queue = await getQueue();
+    for (const company of companies) {
+      await enqueueCrawlJob(
+        { companyId: company.id, domain: company.domain, baseUrl: company.baseUrl, batchId: id, tenantId },
+        queue,
+      );
+    }
+
+    res.json({ batchId: id, reEnqueuedCompanies: companies.length, status: 'PROCESSING' });
+  } catch (err) {
+    console.error('[batches/:id/re-enrich]', err);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
