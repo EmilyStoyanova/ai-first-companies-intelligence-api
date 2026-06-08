@@ -1,3 +1,15 @@
+-- Create PersonalizedContent if it does not exist (was originally added via db push)
+CREATE TABLE IF NOT EXISTS "PersonalizedContent" (
+    "id" TEXT NOT NULL,
+    "companyId" TEXT NOT NULL,
+    "emailSubject" TEXT,
+    "openingLine" TEXT,
+    "valueProposition" TEXT,
+    "fullMessage" TEXT,
+    "generatedAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT "PersonalizedContent_pkey" PRIMARY KEY ("id")
+);
+
 -- Evolve PersonalizedContent table to match new schema
 -- Remove legacy columns added by a prior db push (not tracked in migrations)
 ALTER TABLE "PersonalizedContent" DROP COLUMN IF EXISTS "batchId";

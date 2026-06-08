@@ -201,10 +201,9 @@ async function processDiscoverJob(
         update: {},
       });
 
-      await prisma.tenantCompany.upsert({
-        where: { tenantId_companyId: { tenantId, companyId: company.id } },
-        create: { tenantId, companyId: company.id, sourceBatchId: batchId },
-        update: { sourceBatchId: batchId },
+      await prisma.tenantCompany.createMany({
+        data: [{ tenantId, companyId: company.id, sourceBatchId: batchId }],
+        skipDuplicates: true,
       });
 
       await enqueueCrawlJob(

@@ -18,10 +18,14 @@ export function logSmtpConfig(): void {
     ? `${user.slice(0, 3)}***${user.includes('@') ? '@' + user.split('@')[1] : ''}`
     : '(not set)';
 
-  console.log('[email] SMTP configured:');
+  console.log('[email] SMTP enabled');
   console.log(`[email]   HOST=${host}  PORT=${port}  SECURE=${secure}`);
   console.log(`[email]   USER=${maskedUser}`);
   console.log(`[email]   PASS=${pass ? '*** (set)' : '(NOT SET — delivery will fail)'}`);
+
+  if (!pass) {
+    console.warn('[email]   WARNING: EMAIL_PASS is not set — SMTP authentication will fail.');
+  }
 
   if (host === 'smtp.gmail.com' && pass && pass.includes(' ')) {
     console.warn('[email]   WARNING: EMAIL_PASS contains spaces — Gmail App Passwords must have spaces removed.');
@@ -87,21 +91,20 @@ export async function sendConfirmationEmail(email: string, token: string): Promi
     return;
   }
 
-  console.log(`[email] Sending confirmation to ${email} via ${process.env.EMAIL_HOST}...`);
+  console.log(`[email] sending verification email to ${email}`);
 
   try {
-    const info = await transporter.sendMail({
+    await transporter.sendMail({
       from,
       to: email,
       subject: 'Confirm your Companies Intelligence account',
       text: `Confirm your email address by visiting: ${confirmUrl}`,
       html,
     });
-    console.log(`[email] Delivered to ${email} — messageId: ${info.messageId}`);
+    console.log(`[email] verification email sent`);
   } catch (err) {
     const e = err as Error & { code?: string; responseCode?: number; command?: string };
-    console.error(`[email] SMTP delivery FAILED to ${email}:`);
-    console.error(`[email]   ${e.message}`);
+    console.error(`[email] verification email failed: ${e.message}`);
     if (e.code) console.error(`[email]   code: ${e.code}`);
     if (e.responseCode) console.error(`[email]   smtp_response: ${e.responseCode}`);
     if (e.command) console.error(`[email]   at_command: ${e.command}`);

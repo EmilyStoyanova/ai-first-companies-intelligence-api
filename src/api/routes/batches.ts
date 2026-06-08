@@ -236,11 +236,11 @@ router.post(
           update: {},
         });
 
-        // Link to tenant
-        await prisma.tenantCompany.upsert({
-          where: { tenantId_companyId: { tenantId, companyId: company.id } },
-          create: { tenantId, companyId: company.id, sourceBatchId: batch.id },
-          update: { sourceBatchId: batch.id },
+        // Link to tenant — one record per (tenant, company, batch); re-uploading the same
+        // domain in a new batch creates a new row without overwriting the old batch pointer.
+        await prisma.tenantCompany.createMany({
+          data: [{ tenantId, companyId: company.id, sourceBatchId: batch.id }],
+          skipDuplicates: true,
         });
 
         // Deduplication check
@@ -591,10 +591,9 @@ router.patch('/:id/candidates/:domain', requireAuth, async (req: Request, res: R
           create: { domain, baseUrl, name: candidate.title ?? undefined },
           update: {},
         });
-        await prisma.tenantCompany.upsert({
-          where: { tenantId_companyId: { tenantId, companyId: company.id } },
-          create: { tenantId, companyId: company.id, sourceBatchId: batchId },
-          update: { sourceBatchId: batchId, excluded: false },
+        await prisma.tenantCompany.createMany({
+          data: [{ tenantId, companyId: company.id, sourceBatchId: batchId }],
+          skipDuplicates: true,
         });
         await prisma.discoveryCandidate.update({
           where: { batchId_domain: { batchId, domain } },

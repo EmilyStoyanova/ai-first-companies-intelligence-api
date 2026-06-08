@@ -77,9 +77,19 @@ router.post('/register', async (req: Request, res: Response): Promise<void> => {
     { expiresIn: '7d' }
   );
 
+  // In development (non-production + no SMTP configured), return the verification URL directly
+  // so developers can verify without needing real email delivery.
+  // This field is NEVER included when NODE_ENV=production, regardless of EMAIL_HOST.
+  const isDevMode = process.env.NODE_ENV !== 'production' && !process.env.EMAIL_HOST;
+  const appUrl = process.env.APP_URL || `http://localhost:${process.env.PORT || 3001}`;
+  const devVerificationUrl = isDevMode
+    ? `${appUrl}/api/auth/confirm-email?token=${emailVerificationToken}`
+    : undefined;
+
   res.status(201).json({
     token,
     user: { id: user.id, email: user.email, emailVerified: user.emailVerified, tenantId: tenant.id },
+    ...(devVerificationUrl !== undefined ? { devVerificationUrl } : {}),
   });
 });
 
