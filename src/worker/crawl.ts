@@ -97,7 +97,7 @@ function mergeEmails(text: string, html: string): string[] {
 
 function extractPhones(text: string): string[] {
   const raw = text.match(PHONE_RE) ?? [];
-  return [...new Set(raw
+  const phones = [...new Set(raw
     .map((p) => p.trim())
     .filter((p) => {
       const digits = p.replace(/\D/g, '');
@@ -117,6 +117,7 @@ function extractPhones(text: string): string[] {
       return true;
     })
   )];
+  return phones;
 }
 
 function extractNavLinks($: cheerio.CheerioAPI, baseUrl: string): string[] {
@@ -162,12 +163,14 @@ async function crawlWithCheerio(baseUrl: string): Promise<CrawledPage[]> {
       async requestHandler({ $, request, body }) {
         homepageHtml = body.toString();
         const text = pageText($ as unknown as cheerio.CheerioAPI);
+        const emails = mergeEmails(text, homepageHtml);
+        const phones = extractPhones(text);
         pages.push({
           url: request.url,
           text,
           html: homepageHtml,
-          emails: mergeEmails(text, homepageHtml),
-          phones: extractPhones(text),
+          emails,
+          phones,
         });
       },
       failedRequestHandler({ request, log }) {
@@ -193,13 +196,14 @@ async function crawlWithCheerio(baseUrl: string): Promise<CrawledPage[]> {
       async requestHandler({ $, request }) {
         const text = pageText($ as unknown as cheerio.CheerioAPI);
         const html = $.html();
-        // Save full HTML for pages that are needed for structured extraction
+        const emails = mergeEmails(text, html);
+        const phones = extractPhones(text);
         pages.push({
           url: request.url,
           text,
           html: shouldSaveHtml(request.url) ? html : '',
-          emails: mergeEmails(text, html),
-          phones: extractPhones(text),
+          emails,
+          phones,
         });
       },
       failedRequestHandler() { /* silent */ },
@@ -225,12 +229,14 @@ async function crawlWithPlaywright(baseUrl: string): Promise<CrawledPage[]> {
         const html = await page.content();
         const text = await page.evaluate(() => document.body.innerText);
         homepageHtml = html;
+        const emails = mergeEmails(text, html);
+        const phones = extractPhones(text);
         pages.push({
           url: request.url,
           text,
           html,
-          emails: mergeEmails(text, html),
-          phones: extractPhones(text),
+          emails,
+          phones,
         });
       },
       failedRequestHandler({ request, log }) {
@@ -258,12 +264,14 @@ async function crawlWithPlaywright(baseUrl: string): Promise<CrawledPage[]> {
         await page.waitForLoadState('networkidle', { timeout: 10000 }).catch(() => {});
         const text = await page.evaluate(() => document.body.innerText);
         const html = await page.content();
+        const emails = mergeEmails(text, html);
+        const phones = extractPhones(text);
         pages.push({
           url: request.url,
           text,
           html: shouldSaveHtml(request.url) ? html : '',
-          emails: mergeEmails(text, html),
-          phones: extractPhones(text),
+          emails,
+          phones,
         });
       },
       failedRequestHandler() { /* silent */ },
@@ -275,10 +283,79 @@ async function crawlWithPlaywright(baseUrl: string): Promise<CrawledPage[]> {
   return pages;
 }
 
+// ── Bot-protection detection ─────────────────────────────────────────────────
+// These patterns match challenge/interstitial pages served instead of real content.
+// We detect them AFTER crawling so that both Cheerio and Playwright attempts are covered.
+// Detection does NOT attempt bypasses — it flags the company for human review.
+
+const BOT_INDICATORS: Array<[string, RegExp]> = [
+  // Cloudflare interstitial
+  ['cloudflare-challenge-script',   /challenges\.cloudflare\.com/i],
+  ['cloudflare-just-a-moment',      /<title[^>]*>\s*Just a moment/i],
+  ['cloudflare-enable-js',          /Enable JavaScript and cookies to continue/i],
+  ['cloudflare-checking',           /Checking if the site connection is secure/i],
+  ['cloudflare-ray-id',             /Ray ID:\s*[0-9a-f]{16}/i],
+  ['cloudflare-cf-wrapper',         /class="cf-wrapper"|cf_chl_opt\s*=/i],
+  // DDoS Guard
+  ['ddos-guard',                    /ddos-guard\.net/i],
+  // Generic human verification
+  ['verify-human',                  /Verify you are human/i],
+  ['human-verification-title',      /<title[^>]*>\s*(?:Security Check|Bot Check|Human Verification)\s*<\/title>/i],
+  // Plain access denied page (must be in title to avoid false positives in body copy)
+  ['access-denied-title',           /<title[^>]*>\s*Access Denied\s*<\/title>/i],
+  ['403-forbidden-title',           /<title[^>]*>\s*403\s+Forbidden\s*<\/title>/i],
+];
+
+export const BOT_CRAWL_NOTE =
+  'Site is protected by human verification. Automated crawling could not access the content.';
+
+export function detectBotProtection(pages: CrawledPage[]): { blocked: boolean; indicator: string } {
+  for (const page of pages) {
+    const content = (page.html || '') + '\n' + (page.text || '');
+    for (const [indicator, pattern] of BOT_INDICATORS) {
+      if (pattern.test(content)) {
+        return { blocked: true, indicator };
+      }
+    }
+  }
+  return { blocked: false, indicator: '' };
+}
+
+// Pre-flight fetch for sites that return bot-protection content on 4xx responses.
+// CheerioCrawler discards 4xx response bodies as failed requests, so we fetch
+// the raw response first and check it for bot indicators before running crawlers.
+async function fetchForBotCheck(url: string): Promise<CrawledPage | null> {
+  try {
+    const res = await fetch(url, {
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+      },
+      signal: AbortSignal.timeout(10_000),
+      redirect: 'follow',
+    });
+    if (res.ok) return null;
+    const html = await res.text();
+    if (!html) return null;
+    const $ = cheerio.load(html);
+    const text = pageText($);
+    const candidate: CrawledPage = { url, text, html, emails: [], phones: [] };
+    const { blocked } = detectBotProtection([candidate]);
+    return blocked ? candidate : null;
+  } catch {
+    return null;
+  }
+}
+
 const CRAWL_TIMEOUT_MS = 60_000;
 
 export async function crawlCompany(baseUrl: string): Promise<CrawledPage[]> {
   const crawl = async (): Promise<CrawledPage[]> => {
+    // Pre-flight: capture bot-protection pages served on 4xx responses
+    // (CheerioCrawler would silently drop the 403 body — this preserves it)
+    const blockedPage = await fetchForBotCheck(baseUrl);
+    if (blockedPage) return [blockedPage];
+
     let pages = await crawlWithCheerio(baseUrl);
 
     const totalText = pages.reduce((acc, p) => acc + p.text.trim().length, 0);

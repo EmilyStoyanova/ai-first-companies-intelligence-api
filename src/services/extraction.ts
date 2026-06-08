@@ -24,36 +24,133 @@ export interface ExtractedProfile {
 const SOCIAL_DOMAINS: Record<string, string> = {
   'linkedin.com': 'linkedin',
   'facebook.com': 'facebook',
-  'twitter.com': 'twitter',
-  'x.com': 'twitter',
+  'twitter.com':  'twitter',
+  'x.com':        'twitter',
   'instagram.com': 'instagram',
-  'youtube.com': 'youtube',
+  'youtube.com':  'youtube',
 };
+
+// ── Social URL normalizer ─────────────────────────────────────────────────────
+// Returns a { platform, url } pair when rawUrl is a valid company-level social
+// presence, or null when the URL is a personal profile, post, video, etc.
+// Exported for use in social search enrichment.
+
+export function normalizeSocialUrl(rawUrl: string): { platform: string; url: string } | null {
+  if (!rawUrl.startsWith('http')) return null;
+  let u: URL;
+  try { u = new URL(rawUrl); } catch { return null; }
+
+  const hostname = u.hostname.toLowerCase().replace(/^www\./, '').replace(/^m\./, '');
+  const platform = SOCIAL_DOMAINS[hostname];
+  if (!platform) return null;
+
+  const segments = u.pathname.replace(/\/+$/, '').split('/').filter(Boolean);
+
+  switch (platform) {
+    case 'linkedin': {
+      // Accept only /company/<slug> — reject /in/ (personal), /jobs/, /posts/ etc.
+      if (segments[0] !== 'company' || !segments[1]) return null;
+      return {
+        platform: 'linkedin',
+        url: `https://www.linkedin.com/company/${segments[1].toLowerCase()}`,
+      };
+    }
+
+    case 'facebook': {
+      if (segments.length === 0) return null;
+      const first = segments[0].toLowerCase();
+      const REJECT_FB = new Set([
+        'events', 'groups', 'marketplace', 'watch', 'gaming', 'video', 'videos',
+        'live', 'ads', 'business', 'login', 'logout', 'help', 'policies', 'privacy',
+        'sharer', 'share', 'dialog',
+      ]);
+      if (REJECT_FB.has(first)) return null;
+
+      if (first === 'profile.php') {
+        const id = u.searchParams.get('id');
+        if (!id) return null;
+        return { platform: 'facebook', url: `https://www.facebook.com/profile.php?id=${id}` };
+      }
+      if (first === 'pages') {
+        if (segments.length < 3) return null;
+        return { platform: 'facebook', url: `https://www.facebook.com/pages/${segments[1]}/${segments[2]}` };
+      }
+      // Reject purely numeric slugs (unresolved personal profile IDs)
+      if (/^\d+$/.test(first)) return null;
+      // Normalise to the first path segment — strips /posts/123, /about, etc.
+      return { platform: 'facebook', url: `https://www.facebook.com/${first}` };
+    }
+
+    case 'instagram': {
+      if (segments.length === 0) return null;
+      const REJECT_IG = new Set(['p', 'stories', 'reel', 'reels', 'tv', 'explore', 'accounts', 'about', 'directory']);
+      if (REJECT_IG.has(segments[0].toLowerCase())) return null;
+      return { platform: 'instagram', url: `https://www.instagram.com/${segments[0]}` };
+    }
+
+    case 'youtube': {
+      if (segments.length === 0) return null;
+      const first = segments[0];
+      const firstLower = first.toLowerCase();
+      const REJECT_YT = new Set(['watch', 'results', 'feed', 'playlist', 'shorts', 'trending']);
+      if (REJECT_YT.has(firstLower)) return null;
+      if (first.startsWith('@')) {
+        return { platform: 'youtube', url: `https://www.youtube.com/${first}` };
+      }
+      if (['channel', 'c', 'user'].includes(firstLower) && segments[1]) {
+        return { platform: 'youtube', url: `https://www.youtube.com/${first}/${segments[1]}` };
+      }
+      return null;
+    }
+
+    case 'twitter': {
+      if (segments.length === 0) return null;
+      const REJECT_TW = new Set([
+        'i', 'hashtag', 'search', 'explore', 'notifications', 'messages',
+        'settings', 'home', 'login', 'intent', 'share',
+      ]);
+      if (REJECT_TW.has(segments[0].toLowerCase())) return null;
+      if (!/^[a-zA-Z0-9_]{1,50}$/.test(segments[0])) return null;
+      return { platform: 'twitter', url: `https://twitter.com/${segments[0]}` };
+    }
+
+    default:
+      return null;
+  }
+}
 
 // ── Social links ──────────────────────────────────────────────────────────────
 
 function extractSocialLinks(pages: CrawledPage[]): Record<string, string> {
   const links: Record<string, string> = {};
-  const LINK_RE = /https?:\/\/(www\.)?([\w.-]+)\.[a-z]{2,}\/[\w./?=&%-]*/gi;
+
+  const add = (rawUrl: string) => {
+    const result = normalizeSocialUrl(rawUrl);
+    if (result && !links[result.platform]) links[result.platform] = result.url;
+  };
 
   for (const page of pages) {
-    const matches = page.html.match(LINK_RE) ?? [];
-    for (const m of matches) {
-      try {
-        const url = new URL(m);
-        const hostname = url.hostname.replace(/^www\./, '');
-        for (const [domain, key] of Object.entries(SOCIAL_DOMAINS)) {
-          if (hostname === domain || hostname.endsWith(`.${domain}`)) {
-            if (!links[key]) links[key] = m;
-          }
-        }
-      } catch { /* ignore */ }
-    }
+    if (!page.html) continue;
+    const $ = cheerio.load(page.html);
+
+    // Primary: all anchor hrefs — covers footer social icons, contact links, etc.
+    $('a[href]').each((_i, el) => add($(el).attr('href') ?? ''));
+
+    // <link> tags: some sites declare social profiles via <link rel="me">
+    $('link[href]').each((_i, el) => add($(el).attr('href') ?? ''));
+
+    // Meta tags used by social platforms and CMS plugins
+    add($('meta[property="og:url"]').attr('content') ?? '');
+    add($('meta[property="article:publisher"]').attr('content') ?? '');
   }
+
   return links;
 }
 
 // ── Company name ──────────────────────────────────────────────────────────────
+
+// Titles that are bot-protection or server error pages, never real company names.
+const BLOCKED_TITLE_RE = /^(just a moment|access denied|403 forbidden|security check|bot check|human verification|please wait|ddos protection|attention required)\s*\.{0,3}$/i;
 
 function extractCompanyName(pages: CrawledPage[]): string | undefined {
   const homepage = pages[0];
@@ -65,7 +162,11 @@ function extractCompanyName(pages: CrawledPage[]): string | undefined {
   if (ogSite) return ogSite.trim();
 
   const title = $('title').text().trim();
-  if (title) return title.split(/[|\-–]/)[0].trim();
+  if (title) {
+    const candidate = title.split(/[|\-–]/)[0].trim();
+    if (BLOCKED_TITLE_RE.test(candidate)) return undefined;
+    return candidate;
+  }
 
   return undefined;
 }

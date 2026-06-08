@@ -36,9 +36,12 @@ interface ExportRow {
   services: string;
   team: string;
   teamLinkedIn: string;
-  socialLinks: string;
+  facebook: string;
+  linkedin: string;
+  socialLinks: string;   // other platforms: twitter, instagram, youtube
   completionScore: number;
   crawlStatus: string;
+  crawlNote: string;
   emailSubject: string;
   outreachMessage: string;
 }
@@ -61,9 +64,15 @@ async function fetchRows(batchId: string, tenantId: string): Promise<ExportRow[]
     services: Array.isArray(c.profile?.services) ? (c.profile.services as string[]).join(', ') : '',
     team: serializeTeam(c.profile?.team),
     teamLinkedIn: serializeTeamLinkedIn(c.profile?.team),
-    socialLinks: c.profile?.socialLinks ? JSON.stringify(c.profile.socialLinks) : '',
+    facebook:    ((c.profile?.socialLinks ?? {}) as Record<string, string>)['facebook']  ?? '',
+    linkedin:    ((c.profile?.socialLinks ?? {}) as Record<string, string>)['linkedin']  ?? '',
+    socialLinks: Object.entries((c.profile?.socialLinks ?? {}) as Record<string, string>)
+      .filter(([k, v]) => v && k !== 'facebook' && k !== 'linkedin')
+      .map(([k, v]) => `${k}: ${v}`)
+      .join(' | '),
     completionScore: c.profile?.completionScore ?? 0,
     crawlStatus: c.crawlStatus,
+    crawlNote:   c.crawlNote ?? '',
     emailSubject:    c.personalizedContent?.emailSubject    ?? '',
     outreachMessage: c.personalizedContent?.fullMessage     ?? '',
   }));
@@ -93,9 +102,12 @@ export const ExportService = {
         { header: 'Services',              key: 'services',        width: 50 },
         { header: 'Team',                  key: 'team',            width: 60 },
         { header: 'Team LinkedIn Profiles',key: 'teamLinkedIn',    width: 60 },
-        { header: 'Social Links',          key: 'socialLinks',     width: 50 },
+        { header: 'Facebook',              key: 'facebook',        width: 45 },
+        { header: 'LinkedIn',              key: 'linkedin',        width: 45 },
+        { header: 'Other Social',          key: 'socialLinks',     width: 50 },
         { header: 'Completion Score',      key: 'completionScore', width: 18 },
         { header: 'Crawl Status',          key: 'crawlStatus',     width: 15 },
+        { header: 'Crawl Note',            key: 'crawlNote',       width: 60 },
         { header: 'Email Subject',         key: 'emailSubject',    width: 50 },
         { header: 'Outreach Message',      key: 'outreachMessage', width: 80 },
       ];
@@ -108,8 +120,8 @@ export const ExportService = {
       // CSV
       const headers = [
         'domain', 'name', 'description', 'location',
-        'emails', 'phones', 'services', 'team', 'teamLinkedIn', 'socialLinks',
-        'completionScore', 'crawlStatus',
+        'emails', 'phones', 'services', 'team', 'teamLinkedIn', 'facebook', 'linkedin', 'socialLinks',
+        'completionScore', 'crawlStatus', 'crawlNote',
         'emailSubject', 'outreachMessage',
       ];
 

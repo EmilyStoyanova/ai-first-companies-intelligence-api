@@ -21,6 +21,7 @@ export interface DiscoverPersonaPayload {
   location: string;
   keywords?: string;
   maxResults?: number;
+  forceRecrawl?: boolean;
 }
 
 export interface PersonalizeCompanyPayload {
@@ -56,6 +57,10 @@ export async function enqueueCrawlJob(
   payload: CrawlCompanyPayload,
   queue: PgBoss
 ): Promise<void> {
+  console.log('[enqueue] crawl-company', {
+    companyId: payload.companyId,
+    domain: payload.domain,
+  });
   await queue.send(QUEUES.CRAWL_COMPANY, payload as unknown as object, {
     retryLimit: 3,
     retryDelay: 60,

@@ -7,12 +7,22 @@ export interface DiscoveryParams {
 
 export type CandidateStatus = 'kept' | 'filtered' | 'blocked';
 
+export type RejectionReason =
+  | 'MUNICIPALITY'
+  | 'DIRECTORY'
+  | 'NEWS_SITE'
+  | 'EDUCATION_PORTAL'
+  | 'AGGREGATOR'
+  | 'LOCATION_MISMATCH'
+  | 'NOT_TARGET_ORGANIZATION';
+
 export interface DiscoveredSite {
   url: string;
   domain: string;
   title?: string;
   snippet?: string;
   status: CandidateStatus;
+  rejectionReason?: RejectionReason;
 }
 
 function extractDomain(rawUrl: string): string | null {
@@ -59,10 +69,13 @@ const SKIP_DOMAINS = [
   // Municipality & government portals (subdomains like live.varna.bg also matched)
   'obshtini.bg', 'varna.bg', 'sofia.bg', 'plovdiv.bg', 'burgas.bg',
   'ruse.bg', 'stara-zagora.bg', 'pleven.bg', 'sliven.bg', 'dobrich.bg',
-  'lovech.bg', 'montana.bg', 'vidin.bg', 'vratsa.bg', 'gabrovo.bg',
+  'lovech.bg', 'montana.bg', 'vidin.bg', 'vratsa.bg', 'vratza.bg', 'gabrovo.bg',
   'targovishte.bg', 'razgrad.bg', 'shumen.bg', 'silistra.bg',
   'kardzhali.bg', 'smolyan.bg', 'blagoevgrad.bg', 'kyustendil.bg',
   'pernik.bg', 'sofia-grad.bg', 'government.bg', 'parliament.bg',
+  // Additional municipality domains with alternate spellings / obshtina- prefix
+  'obshtina.bg', 'pazardzhik.bg', 'lovech-obshtina.bg',
+  'yambol.bg', 'haskovo.bg', 'sandanski.bg', 'blagoevgrad-ob.bg',
   // Category-specific aggregator sites
   'detskigradini.bg', 'detskitegradini.com', 'registarnadetskitegradini.com',
   // Review & travel aggregators
@@ -76,15 +89,31 @@ const SKIP_DOMAINS = [
 
 // Pattern-based rules for domain families that can't be enumerated
 const SKIP_PATTERNS: RegExp[] = [
-  /^ruo-/,          // Regional education departments: ruo-varna.bg, ruo-sofia.bg …
-  /^rio-/,          // Older naming variant of the same offices
-  /\.government\.bg$/, // Any government subdomain
+  /^ruo-/,              // Regional education departments: ruo-varna.bg, ruo-sofia.bg …
+  /^rio-/,              // Older naming variant of the same offices
+  /\.government\.bg$/,  // Any government subdomain
+  /^obshtina-/,         // Municipality domains: obshtina-sofia.bg, obshtina-varna.bg …
 ];
 
 function shouldSkip(domain: string): boolean {
   if (SKIP_DOMAINS.some((d) => domain === d || domain.endsWith(`.${d}`))) return true;
   if (SKIP_PATTERNS.some((re) => re.test(domain))) return true;
   return false;
+}
+
+// ── Search provider error ─────────────────────────────────────────────────────
+// Thrown when Brave returns a billing/quota/auth status that means no results
+// can be trusted. Distinct from an empty-results response (which is valid data).
+
+export class SearchProviderError extends Error {
+  constructor(
+    public readonly statusCode: number,
+    public readonly query: string,
+    public readonly provider: string = 'unknown',
+  ) {
+    super(`${provider} returned HTTP ${statusCode} for query "${query}"`);
+    this.name = 'SearchProviderError';
+  }
 }
 
 // ── Brave Search API ──────────────────────────────────────────────────────────
@@ -99,6 +128,11 @@ interface BraveResult {
 
 const BRAVE_COUNT = 20; // Brave max results per request
 
+// Status codes that indicate a billing, quota, auth, or rate-limit problem.
+// On these codes we throw SearchProviderError instead of silently returning [].
+// Returning [] would mislead the caller into thinking there are no matching sites.
+const PROVIDER_HARD_ERROR_CODES = new Set([401, 402, 403, 429]);
+
 async function fetchBraveQuery(apiKey: string, query: string): Promise<DiscoveredSite[]> {
   const url =
     `https://api.search.brave.com/res/v1/web/search` +
@@ -109,7 +143,14 @@ async function fetchBraveQuery(apiKey: string, query: string): Promise<Discovere
   });
 
   if (!res.ok) {
-    console.warn(`[discovery] Brave error for query "${query}": ${res.status}`);
+    let bodySnippet = '(empty)';
+    try { bodySnippet = (await res.text()).slice(0, 300); } catch { /* ignore */ }
+
+    if (PROVIDER_HARD_ERROR_CODES.has(res.status)) {
+      console.error(`[discovery] Brave hard error HTTP ${res.status} query="${query}" body=${bodySnippet}`);
+      throw new SearchProviderError(res.status, query, 'Brave Search');
+    }
+    console.warn(`[discovery] Brave soft error HTTP ${res.status} query="${query}" body=${bodySnippet}`);
     return [];
   }
 
@@ -131,22 +172,136 @@ async function fetchBraveQuery(apiKey: string, query: string): Promise<Discovere
   return results;
 }
 
-function buildQueryVariations(params: DiscoveryParams): string[] {
-  const base = [params.persona.trim(), params.location.trim()];
-  if (params.keywords?.trim()) base.push(params.keywords.trim());
+// ── Serper.dev API ────────────────────────────────────────────────────────────
+// Alternative to Brave Search. Sign up at https://serper.dev
+// Free tier: 2,500 queries. Set env vars: SEARCH_PROVIDER=serper SERPER_API_KEY=...
 
-  return [
-    [...base, 'официален сайт'].join(' '),
-    [...base, 'контакти'].join(' '),
-    [...base, 'услуги'].join(' '),
-  ];
+interface SerperResult {
+  title?: string;
+  link: string;
+  snippet?: string;
 }
 
-async function searchViaBrave(params: DiscoveryParams): Promise<DiscoveredSite[]> {
-  const apiKey = process.env.BRAVE_SEARCH_API_KEY!;
-  const variations = buildQueryVariations(params);
+async function fetchSerperQuery(apiKey: string, query: string): Promise<DiscoveredSite[]> {
+  const res = await fetch('https://google.serper.dev/search', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'X-API-KEY': apiKey,
+    },
+    body: JSON.stringify({ q: query, gl: 'bg', hl: 'bg', num: BRAVE_COUNT }),
+  });
 
-  const pages = await Promise.all(variations.map((q) => fetchBraveQuery(apiKey, q)));
+  if (!res.ok) {
+    let bodySnippet = '(empty)';
+    try { bodySnippet = (await res.text()).slice(0, 300); } catch { /* ignore */ }
+
+    if (PROVIDER_HARD_ERROR_CODES.has(res.status)) {
+      console.error(`[discovery] Serper hard error HTTP ${res.status} query="${query}" body=${bodySnippet}`);
+      throw new SearchProviderError(res.status, query, 'Serper');
+    }
+    console.warn(`[discovery] Serper soft error HTTP ${res.status} query="${query}" body=${bodySnippet}`);
+    return [];
+  }
+
+  const data = await res.json() as { organic?: SerperResult[] };
+  const results: DiscoveredSite[] = [];
+
+  for (const item of data.organic ?? []) {
+    const domain = extractDomain(item.link);
+    if (!domain) continue;
+    results.push({
+      url: item.link,
+      domain,
+      title: item.title,
+      snippet: item.snippet,
+      status: shouldSkip(domain) ? 'blocked' : 'kept',
+    });
+  }
+
+  return results;
+}
+
+// ── Provider dispatch ─────────────────────────────────────────────────────────
+
+function activeProvider(): 'brave' | 'serper' {
+  return process.env.SEARCH_PROVIDER?.toLowerCase() === 'serper' ? 'serper' : 'brave';
+}
+
+async function fetchQuery(query: string): Promise<DiscoveredSite[]> {
+  const provider = activeProvider();
+  if (provider === 'serper') {
+    return fetchSerperQuery(process.env.SERPER_API_KEY!, query);
+  }
+  return fetchBraveQuery(process.env.BRAVE_SEARCH_API_KEY!, query);
+}
+
+// Major towns per Bulgarian oblast, ordered by population.
+// Used to generate per-town search queries when the location is an oblast.
+const OBLAST_TOWNS: Record<string, string[]> = {
+  'ловеч':          ['Ловеч', 'Троян', 'Луковит', 'Тетевен'],
+  'пловдив':        ['Пловдив', 'Асеновград', 'Карлово', 'Раковски'],
+  'варна':          ['Варна', 'Провадия', 'Девня', 'Долни Чифлик'],
+  'бургас':         ['Бургас', 'Несебър', 'Поморие', 'Айтос'],
+  'софия':          ['София', 'Ботевград', 'Самоков', 'Ихтиман'],
+  'стара загора':   ['Стара Загора', 'Казанлък', 'Чирпан', 'Гълъбово'],
+  'велико търново': ['Велико Търново', 'Горна Оряховица', 'Свищов', 'Лясковец'],
+  'русе':           ['Русе', 'Бяла', 'Ветово', 'Борово'],
+  'плевен':         ['Плевен', 'Кнежа', 'Никопол', 'Долни Дъбник'],
+  'габрово':        ['Габрово', 'Севлиево', 'Дряново', 'Трявна'],
+  'видин':          ['Видин', 'Белоградчик', 'Брегово'],
+  'враца':          ['Враца', 'Козлодуй', 'Мездра', 'Бяла Слатина'],
+  'монтана':        ['Монтана', 'Берковица', 'Лом', 'Вършец'],
+  'добрич':         ['Добрич', 'Балчик', 'Каварна', 'Тервел'],
+  'шумен':          ['Шумен', 'Нови пазар', 'Велики Преслав', 'Каспичан'],
+  'хасково':        ['Хасково', 'Димитровград', 'Свиленград', 'Харманли'],
+  'кърджали':       ['Кърджали', 'Момчилград', 'Крумовград', 'Джебел'],
+  'смолян':         ['Смолян', 'Девин', 'Рудозем', 'Чепеларе'],
+  'благоевград':    ['Благоевград', 'Сандански', 'Разлог', 'Банско'],
+  'кюстендил':      ['Кюстендил', 'Дупница', 'Бобошево'],
+  'перник':         ['Перник', 'Радомир', 'Брезник'],
+  'разград':        ['Разград', 'Исперих', 'Кубрат', 'Лозница'],
+  'силистра':       ['Силистра', 'Тутракан', 'Дулово', 'Алфатар'],
+  'търговище':      ['Търговище', 'Попово', 'Омуртаг', 'Антоново'],
+  'сливен':         ['Сливен', 'Нова Загора', 'Котел', 'Твърдица'],
+  'ямбол':          ['Ямбол', 'Елхово', 'Стралджа'],
+  'пазарджик':      ['Пазарджик', 'Велинград', 'Панагюрище', 'Ракитово'],
+};
+
+// Extract major towns for a location string that looks like "област Ловеч" or "Ловеч".
+// Returns an empty array for city-level locations (no expansion needed).
+function getOblastTowns(location: string): string[] {
+  // Match "област X" or "oblast X" (case-insensitive)
+  const oblastMatch = location.match(/^(?:област|oblast)\s+(.+)$/i);
+  const key = (oblastMatch ? oblastMatch[1] : location).toLowerCase().trim();
+  return OBLAST_TOWNS[key] ?? [];
+}
+
+function buildQueryVariations(params: DiscoveryParams): string[] {
+  const persona = params.persona.trim();
+  const location = params.location.trim();
+  const extra = params.keywords?.trim() ? ` ${params.keywords.trim()}` : '';
+
+  const queries: string[] = [
+    `${persona} ${location}${extra} официален сайт`,
+    `${persona} ${location}${extra} контакти телефон имейл`,
+    `site:.bg ${persona} ${location}${extra}`,
+    `${persona} ${location}${extra} услуги`,
+  ];
+
+  // For oblast locations, append per-town queries for top 3 towns.
+  // Each town query targets the specific municipality, complementing the oblast-level queries.
+  const towns = getOblastTowns(location).slice(0, 3);
+  for (const town of towns) {
+    queries.push(`${persona} ${town}${extra} контакти`);
+  }
+
+  return queries;
+}
+
+async function searchViaProvider(params: DiscoveryParams): Promise<DiscoveredSite[]> {
+  const variations = buildQueryVariations(params);
+  const pages = await Promise.all(variations.map((q) => fetchQuery(q)));
 
   // Merge, deduplicate by domain — keep ALL (blocked + kept)
   const seen = new Set<string>();
@@ -163,6 +318,18 @@ async function searchViaBrave(params: DiscoveryParams): Promise<DiscoveredSite[]
   return results;
 }
 
+// ── Groq response types ───────────────────────────────────────────────────────
+
+interface GroqRejection {
+  i: number;
+  c: RejectionReason;
+}
+
+interface GroqFilterResponse {
+  k: number[];
+  r: GroqRejection[];
+}
+
 // ── Groq relevance filter ─────────────────────────────────────────────────────
 // Sends only 'kept' candidates to Groq. Non-selected ones get status 'filtered'.
 // 'blocked' candidates are never sent to Groq — their status stays 'blocked'.
@@ -172,7 +339,6 @@ async function groqRelevanceFilter(
   sites: DiscoveredSite[],
   params: DiscoveryParams,
 ): Promise<DiscoveredSite[]> {
-  // Only send non-blocked candidates to Groq
   const candidates = sites.filter((s) => s.status === 'kept');
   if (candidates.length === 0) return sites;
 
@@ -183,73 +349,54 @@ async function groqRelevanceFilter(
   }
 
   const items = candidates
-    .map((s, i) => `${i}: ${s.title ?? s.domain} — ${s.snippet ?? ''}`)
+    .map((s, i) => `${i}: ${s.title ?? s.domain} — ${s.snippet ?? '(no snippet)'}`)
     .join('\n');
 
-  const searchContext = [
-    `"${params.persona}"`,
-    `in "${params.location}"`,
-    params.keywords ? `(keywords: ${params.keywords})` : '',
-  ]
-    .filter(Boolean)
-    .join(' ');
-
   const prompt =
-    `You are filtering web search results.
+    `You are a B2B lead qualification engine for the Bulgarian market.
 
-    Goal:
-    Return ONLY results that are the official website of a SINGLE real-world company or organisation that matches the search intent.
+TASK: For each result, determine if the website is owned/operated BY an organization that IS ITSELF a "${params.persona}" in or near "${params.location}".
 
-    Search intent:
-    "${searchContext}"
+CRITICAL DISTINCTION — the key question is ownership/identity, not topic:
+- Website that MENTIONS or LISTS "${params.persona}" → REJECT
+- Website that IS OPERATED BY a "${params.persona}" → KEEP
 
-    Results (index: title — snippet):
-    ${items}
+Ask yourself: "Would this organization describe itself as '${params.persona}'?"
+If YES → KEEP.  If NO (they manage/list/discuss/oversee them) → REJECT.
 
-    Definition of "official website":
-    - The primary website owned/controlled by that company or organisation
-    - Represents exactly ONE entity (not multiple)
-    - Typically contains: services/products, contact info, about page, branding
+KEEP if:
+1. The organization itself IS a ${params.persona}
+2. It's in or near "${params.location}"
+3. It appears to be the official site of exactly one organization
 
-    STRICT KEEP rules:
-    - Must clearly represent ONE specific company or organisation
-    - Must match the search intent (e.g. IT company in Varna, kindergarten in Lovech)
-    - Local business websites are valid
+REJECT with reason:
+- MUNICIPALITY: City hall, obshtina, regional government portal (even if it has a "${params.persona}" section)
+- DIRECTORY: Lists or aggregates multiple organizations of this type
+- NEWS_SITE: News article, blog, press release, announcement
+- EDUCATION_PORTAL: Government education authority (RUO, RIO, MОН) — not the school/kindergarten itself
+- AGGREGATOR: Ratings, reviews, comparisons, top-N lists
+- LOCATION_MISMATCH: Clearly in a different city/region
+- NOT_TARGET_ORGANIZATION: Wrong category of organization entirely
 
-    STRICT DISCARD rules:
-    - Directories, aggregators, listings (e.g. "top companies", "catalog", "firms in X")
-    - Marketplace / classifieds
-    - Job boards
-    - Review sites (e.g. ratings, comparisons)
-    - Maps (Google Maps, etc.)
-    - Social media pages (Facebook, LinkedIn, Instagram)
-    - Government / municipality portals
-    - Wikipedia or informational sites
-    - Pages listing MULTIPLE businesses
-    - Generic landing pages not tied to a specific company
+ILLUSTRATIVE EXAMPLES (for "детски градини" in "гр. Враца"):
 
-    Edge cases:
-    - If unsure → DISCARD
-    - If multiple companies are mentioned → DISCARD
-    - If it's a subpage of a directory → DISCARD
+KEEP — these ARE kindergartens:
+  "ДГ Звънче – Официален сайт, гр. Враца" → ДГ prefix = детска градина ✓
+  "Детска градина Пролет Враца – Записване и контакти" → explicitly a kindergarten ✓
 
-    Examples:
+REJECT — these are NOT kindergartens:
+  "Община Враца – раздел Детски градини" → MUNICIPALITY (municipal portal, not a kindergarten)
+  "vratza.bg – Официален сайт на Община Враца" → MUNICIPALITY
+  "Детски градини Враца | Пълен списък и рейтинг" → DIRECTORY
+  "ruo-vratsa.bg – РИО Враца" → EDUCATION_PORTAL
+  "Новини: Нова детска градина ще отвори врати" → NEWS_SITE
 
-    Search: "IT companies Varna"
+Results to classify (index: title — snippet):
+${items}
 
-    KEEP:
-    - "XYZ Software Ltd – Custom Software Development"
-    - "ABC Tech Varna – IT Services"
-
-    DISCARD:
-    - "Top 10 IT Companies in Varna"
-    - "varnafirms.bg"
-    - "Yellow Pages Varna"
-    - "LinkedIn company listings"
-
-    Output format:
-    Return ONLY a JSON array of indices (e.g. [0,2,4])
-    No explanation. No text.`;
+Output: ONLY valid JSON in this exact format, no other text:
+{"k":[kept_indices],"r":[{"i":rejected_index,"c":"REASON_CODE"},...]}`
+;
 
   try {
     const res = await fetch('https://api.groq.com/openai/v1/chat/completions', {
@@ -262,7 +409,7 @@ async function groqRelevanceFilter(
         model: 'llama-3.1-8b-instant',
         messages: [{ role: 'user', content: prompt }],
         temperature: 0,
-        max_tokens: 150,
+        max_tokens: 400,
       }),
     });
 
@@ -274,25 +421,47 @@ async function groqRelevanceFilter(
     const data = await res.json() as { choices: Array<{ message: { content: string } }> };
     const raw = data.choices[0]?.message?.content?.trim() ?? '';
 
-    // Strip markdown code fences and extract the JSON array — LLMs sometimes wrap output
-    const match = raw.match(/\[[\d,\s]*\]/);
-    if (!match) throw new Error(`no JSON array in Groq response: ${raw.slice(0, 80)}`);
+    // Try new structured format first: {"k":[...],"r":[...]}
+    const objectMatch = raw.match(/\{[\s\S]*"k"\s*:\s*\[[\s\S]*?\][\s\S]*\}/);
+    // Fall back to legacy format: [0,2,4]
+    const arrayMatch = raw.match(/\[[\d,\s]*\]/);
 
-    const indices: unknown = JSON.parse(match[0]);
-    if (!Array.isArray(indices)) throw new Error('not an array');
+    let keptIndices: Set<number>;
+    const rejectionMap = new Map<number, RejectionReason>();
 
-    const keptIndices = new Set(
-      (indices as unknown[]).filter(
-        (i): i is number => typeof i === 'number' && i >= 0 && i < candidates.length,
-      ),
-    );
+    if (objectMatch) {
+      const parsed = JSON.parse(objectMatch[0]) as GroqFilterResponse;
+      keptIndices = new Set(
+        (parsed.k ?? []).filter((i): i is number => typeof i === 'number' && i >= 0 && i < candidates.length),
+      );
+      for (const entry of parsed.r ?? []) {
+        if (typeof entry.i === 'number' && typeof entry.c === 'string') {
+          rejectionMap.set(entry.i, entry.c as RejectionReason);
+        }
+      }
+    } else if (arrayMatch) {
+      const indices = JSON.parse(arrayMatch[0]) as unknown[];
+      keptIndices = new Set(
+        indices.filter((i): i is number => typeof i === 'number' && i >= 0 && i < candidates.length),
+      );
+    } else {
+      throw new Error(`unparseable Groq response: ${raw.slice(0, 120)}`);
+    }
 
     // Rebuild full list: blocked stays blocked, kept→filtered if Groq rejected
     let candidateIdx = 0;
     const result = sites.map((site) => {
       if (site.status !== 'kept') return site;
       const idx = candidateIdx++;
-      return keptIndices.has(idx) ? site : { ...site, status: 'filtered' as const };
+      if (keptIndices.has(idx)) return site;
+      const reason = rejectionMap.get(idx);
+      if (reason) {
+        console.log(
+          `[discovery] filtered ${site.domain} — ${reason}` +
+          (site.title ? ` (${site.title.slice(0, 60)})` : ''),
+        );
+      }
+      return { ...site, status: 'filtered' as const, rejectionReason: reason };
     });
 
     const keptCount = result.filter((s) => s.status === 'kept').length;
@@ -309,12 +478,16 @@ async function groqRelevanceFilter(
 // them and the UI can show the full picture.
 
 export async function discoverSites(params: DiscoveryParams): Promise<DiscoveredSite[]> {
-  if (!process.env.BRAVE_SEARCH_API_KEY) {
-    throw new Error('BRAVE_SEARCH_API_KEY is not set.');
+  const provider = activeProvider();
+
+  if (provider === 'serper') {
+    if (!process.env.SERPER_API_KEY) throw new Error('SERPER_API_KEY is not set (SEARCH_PROVIDER=serper).');
+  } else {
+    if (!process.env.BRAVE_SEARCH_API_KEY) throw new Error('BRAVE_SEARCH_API_KEY is not set.');
   }
 
-  console.log(`[discovery] queries=${JSON.stringify(buildQueryVariations(params))}`);
+  console.log(`[discovery] provider=${provider} queries=${JSON.stringify(buildQueryVariations(params))}`);
 
-  const raw = await searchViaBrave(params);
+  const raw = await searchViaProvider(params);
   return groqRelevanceFilter(raw, params);
 }

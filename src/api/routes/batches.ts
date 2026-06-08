@@ -7,6 +7,7 @@ import fs from 'fs';
 import { prisma } from '../../lib/prisma';
 import { StorageService } from '../../services/storage';
 import { getQueue, enqueueCrawlJob } from '../../lib/queue';
+import { checkFreshness } from '../../lib/freshness';
 import { requireAuth, requireVerified } from '../../middleware/auth';
 import { ExportService } from '../../services/export';
 
@@ -229,11 +230,12 @@ router.post(
       for (const domain of domains) {
         const baseUrl = buildBaseUrl(domain);
 
-        // Upsert company
+        // Upsert company — include profile so freshness check can evaluate quality
         const company = await prisma.company.upsert({
           where: { domain },
           create: { domain, baseUrl },
           update: {},
+          include: { profile: true },
         });
 
         // Link to tenant — one record per (tenant, company, batch); re-uploading the same
@@ -243,20 +245,17 @@ router.post(
           skipDuplicates: true,
         });
 
-        // Deduplication check
-        const thirtyDaysAgo = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000);
-        const shouldSkip =
-          !forceRecrawl &&
-          company.lastCrawledAt !== null &&
-          company.lastCrawledAt > thirtyDaysAgo;
+        const freshness = checkFreshness(company, forceRecrawl);
 
-        if (shouldSkip) {
-          // Already fresh — count it as processed immediately
+        if (freshness.skip) {
+          console.log(`[upload] skipped fresh company ${domain} — ${freshness.reason}`);
+          // Reuse existing crawl data — count as processed immediately
           await prisma.crawlBatch.update({
             where: { id: batch.id },
             data: { processedCompanies: { increment: 1 } },
           });
         } else {
+          console.log(`[upload] recrawling ${domain} — ${freshness.reason}`);
           await enqueueCrawlJob(
             { companyId: company.id, domain, baseUrl, batchId: batch.id, tenantId },
             queue

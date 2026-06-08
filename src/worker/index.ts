@@ -1,9 +1,11 @@
 import 'dotenv/config';
 import { getQueue, QUEUES, CrawlCompanyPayload, DiscoverPersonaPayload, PersonalizeCompanyPayload, enqueueCrawlJob, enqueuePersonalizeJob, stopQueue } from '../lib/queue';
 import { prisma } from '../lib/prisma';
-import { crawlCompany } from './crawl';
+import { crawlCompany, detectBotProtection, BOT_CRAWL_NOTE } from './crawl';
 import { extractProfile } from '../services/extraction';
-import { discoverSites } from '../services/discovery';
+import { enrichSocialLinks } from '../services/socialEnrichment';
+import { discoverSites, SearchProviderError } from '../services/discovery';
+import { checkFreshness } from '../lib/freshness';
 import { generatePersonalizedContent } from '../services/personalization';
 import PgBoss from 'pg-boss';
 
@@ -40,6 +42,18 @@ async function processSingleJob(job: PgBoss.JobWithMetadata<CrawlCompanyPayload>
       return;
     }
 
+    // 1b. Bot-protection check — if detected, mark BLOCKED and stop without extracting
+    const { blocked, indicator } = detectBotProtection(pages);
+    if (blocked) {
+      await prisma.company.update({
+        where: { id: companyId },
+        data: { crawlStatus: 'BLOCKED', crawlNote: BOT_CRAWL_NOTE },
+      });
+      await updateBatchProgress(batchId);
+      console.log(`[worker] blocked ${domain} — bot protection detected (${indicator})`);
+      return;
+    }
+
     // 2. Save raw data
     await prisma.rawCompanyProfile.createMany({
       data: pages.map((p) => ({
@@ -53,6 +67,16 @@ async function processSingleJob(job: PgBoss.JobWithMetadata<CrawlCompanyPayload>
 
     // 3. Extract processed profile
     const profile = extractProfile(pages);
+
+    // 3b. Enrich missing social links from search (best-effort, non-critical)
+    try {
+      const enrichedSocial = await enrichSocialLinks(profile, domain);
+      if (Object.keys(enrichedSocial).length > 0) {
+        const hadSocial = Object.keys(profile.socialLinks).length > 0;
+        profile.socialLinks = { ...profile.socialLinks, ...enrichedSocial };
+        if (!hadSocial) profile.completionScore += 5; // FIELD_WEIGHTS.socialLinks
+      }
+    } catch { /* non-critical */ }
 
     // 4. Upsert CompanyProfile
     await prisma.companyProfile.upsert({
@@ -151,12 +175,15 @@ async function updateBatchProgress(batchId: string): Promise<void> {
 async function processDiscoverJob(
   job: PgBoss.JobWithMetadata<DiscoverPersonaPayload>
 ): Promise<void> {
-  const { batchId, tenantId, persona, location, keywords, maxResults } = job.data;
+  const { batchId, tenantId, persona, location, keywords, maxResults, forceRecrawl } = job.data;
   console.log(`[worker/discover] starting discovery: "${persona}" in "${location}"`);
 
   try {
     const allSites = await discoverSites({ persona, location, keywords, maxResults });
-    const keptSites = allSites.filter((s) => s.status === 'kept');
+
+    // Cap to maxResults — quota was already checked against this limit at request time
+    const limit = maxResults ?? 50;
+    const keptSites = allSites.filter((s) => s.status === 'kept').slice(0, limit);
 
     // Persist all candidates (kept + filtered + blocked) for the UI
     if (allSites.length > 0) {
@@ -184,21 +211,26 @@ async function processDiscoverJob(
 
     console.log(`[worker/discover] kept=${keptSites.length} total=${allSites.length}`);
 
-    // Update batch with the count of sites to crawl
+    // Update batch with the count of sites to crawl (before dedup — will be corrected below)
     await prisma.crawlBatch.update({
       where: { id: batchId },
       data: { totalCompanies: keptSites.length },
     });
 
     const crawlQueue = await getQueue();
+    let jobsEnqueued = 0;
+    let skippedFresh = 0;
 
     for (const site of keptSites) {
       const baseUrl = `https://${site.domain}`;
 
+      // upsert returns existing record unchanged (update: {}) so lastCrawledAt is current
+      // include profile so freshness check can evaluate quality
       const company = await prisma.company.upsert({
         where: { domain: site.domain },
         create: { domain: site.domain, baseUrl, name: site.title },
         update: {},
+        include: { profile: true },
       });
 
       await prisma.tenantCompany.createMany({
@@ -206,26 +238,58 @@ async function processDiscoverJob(
         skipDuplicates: true,
       });
 
-      await enqueueCrawlJob(
-        { companyId: company.id, domain: site.domain, baseUrl, batchId, tenantId },
-        crawlQueue
-      );
+      const freshness = checkFreshness(company, forceRecrawl ?? false);
+
+      if (freshness.skip) {
+        console.log(`[discover] skipped fresh company ${site.domain} — ${freshness.reason}`);
+        skippedFresh++;
+        await updateBatchProgress(batchId);
+      } else {
+        console.log(`[discover] recrawling ${site.domain} — ${freshness.reason}`);
+        await enqueueCrawlJob(
+          { companyId: company.id, domain: site.domain, baseUrl, batchId, tenantId },
+          crawlQueue
+        );
+        jobsEnqueued++;
+      }
     }
 
-    // Increment tenant weekly usage
-    await prisma.tenant.update({
-      where: { id: tenantId },
-      data: { weeklyUsage: { increment: keptSites.length } },
-    });
+    // Increment tenant weekly usage by accepted (not skipped) companies
+    if (jobsEnqueued > 0) {
+      await prisma.tenant.update({
+        where: { id: tenantId },
+        data: { weeklyUsage: { increment: jobsEnqueued } },
+      });
+    }
 
-    console.log(`[worker/discover] enqueued ${keptSites.length} crawl jobs for batch ${batchId}`);
+    console.log(`[worker/discover] enqueued=${jobsEnqueued} skippedFresh=${skippedFresh} for batch ${batchId}`);
   } catch (err) {
+    if (err instanceof SearchProviderError) {
+      // Billing / quota / auth / rate-limit from Brave — fail this batch without retrying.
+      // Store the note inside searchQuery so the frontend can surface it without a schema change.
+      const errorNote = `Search provider quota/billing error. Brave Search returned HTTP ${err.statusCode}.`;
+      console.error(
+        `[worker/discover] provider error HTTP ${err.statusCode} for batch ${batchId} ` +
+        `— query="${err.query}" — ${errorNote}`,
+      );
+      const batchRecord = await prisma.crawlBatch.findUnique({
+        where: { id: batchId },
+        select: { searchQuery: true },
+      });
+      const sq = (batchRecord?.searchQuery ?? {}) as Record<string, unknown>;
+      await prisma.crawlBatch.update({
+        where: { id: batchId },
+        data: { status: 'FAILED', searchQuery: { ...sq, _errorNote: errorNote } },
+      });
+      return; // Do not re-throw — provider error is not retryable via pg-boss
+    }
+
     console.error('[worker/discover] failed:', err);
     await prisma.crawlBatch.update({
       where: { id: batchId },
       data: { status: 'FAILED' },
     });
-    throw err;
+    throw err; // Other errors — let pg-boss retry
   }
 }
 

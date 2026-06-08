@@ -49,11 +49,12 @@ const router = Router();
  *         description: Weekly quota exceeded
  */
 router.post('/', requireAuth, requireVerified, async (req: Request, res: Response): Promise<void> => {
-  const { persona, location, keywords, maxResults: rawMax } = req.body as {
+  const { persona, location, keywords, maxResults: rawMax, force_recrawl } = req.body as {
     persona?: string;
     location?: string;
     keywords?: string;
     maxResults?: number;
+    force_recrawl?: boolean;
   };
 
   if (!persona?.trim() || !location?.trim()) {
@@ -114,6 +115,7 @@ router.post('/', requireAuth, requireVerified, async (req: Request, res: Respons
         location: location.trim(),
         keywords: keywords?.trim(),
         maxResults,
+        forceRecrawl: Boolean(force_recrawl),
       },
       queue
     );
