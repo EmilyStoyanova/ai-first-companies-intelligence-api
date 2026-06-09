@@ -1,6 +1,10 @@
 import { CheerioCrawler, PlaywrightCrawler, Configuration } from 'crawlee';
 import { MemoryStorage } from '@crawlee/memory-storage';
 import * as cheerio from 'cheerio';
+import { mergeEmails } from '../lib/emailExtraction';
+import { extractPhones } from '../lib/phoneExtraction';
+import { detectLoginPage } from '../services/loginDetection';
+import { extractLogoUrls } from '../services/logoExtraction';
 
 export interface CrawledPage {
   url: string;
@@ -8,121 +12,40 @@ export interface CrawledPage {
   html: string;
   emails: string[];
   phones: string[];
+  loginProtected: boolean;
+  logoUrls: string[];
 }
 
-const EMAIL_RE = /[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}/g;
+// Contact pages get crawl priority so they're never crowded out by nav links.
+const CONTACT_PATHS = ['/contact', '/contact-us', '/contacts', '/kontakti', '/контакти', '/kontakt'];
 
-// Strict phone regex: must start with +/00 (international) or 0 (local)
-// This rejects standalone numbers like 226.5000 or coordinates
-const PHONE_RE = /(?<!\d)((?:\+\d{1,3}|00\d{1,3})[\s\-.()]*(?: *\d[\s\-.()]*){6,14}|0\d{1,4}[\s\-.](?:\d[\s\-.]?){5,11})(?![\d\-])/g;
-
-const JUNK_EMAIL_PREFIXES = [
-  'noreply', 'no-reply', 'donotreply', 'git@', 'sender@', 'recipient@',
-  'user1@', 'user2@', 'reply@', 'open@', 'u003e',
-];
-const JUNK_EMAIL_DOMAINS = [
-  'example.com', 'example.org', 'example.bg',
-  'cluster.mongodb.net',
-  // Placeholder / demo domains frequently found in website HTML
-  'website.com', 'yourwebsite.com', 'yourdomain.com', 'domain.com',
-  'mysite.com', 'yoursite.com', 'yourcompany.com', 'company.com',
-  'email.com', 'mail.com', 'test.com', 'demo.com', 'placeholder.com',
-  'sentry.io',    // error tracking addresses, not contact emails
-  'sampleemail.com', 'mailserver.com',
+// Team / management pages — high priority after contact so people data is never cut by the slice.
+const TEAM_PATHS = [
+  '/team', '/about', '/about-us', '/aboutus', '/leadership', '/management', '/people', '/staff',
+  '/ekip', '/za-nas', '/za-firmata',
+  '/екип', '/ръководство', '/управление', '/собственици', '/за-нас', '/за-фирмата',
 ];
 
-const FALLBACK_PATHS = ['/about', '/team', '/services', '/contact', '/contact-us', '/contacts', '/kontakti', '/контакти', '/history'];
+// Remaining generic fallback pages (lower priority than team pages)
+const FALLBACK_PATHS = ['/services', '/history'];
 
 // Pages where we must save the full HTML for structured extraction (team, services, etc.)
-const HTML_SAVE_PATHS = ['/team', '/about', '/services', '/service', '/contact', '/contact-us', '/contacts', '/kontakti', '/history', '/people', '/staff'];
+const HTML_SAVE_PATHS = [
+  '/contact', '/contact-us', '/contacts', '/kontakti', '/контакти', '/kontakt',
+  '/team', '/about', '/about-us', '/aboutus', '/za-nas', '/za-firmata',
+  '/leadership', '/management', '/people', '/staff', '/services', '/service', '/history',
+  '/ekip', '/екип', '/ръководство', '/управление', '/собственици', '/за-нас', '/за-фирмата',
+];
 
 function shouldSaveHtml(url: string): boolean {
   return HTML_SAVE_PATHS.some((p) => url.includes(p));
 }
 
-function filterEmails(raw: string[]): string[] {
-  return [...new Set(raw.filter((e) => {
-    const lower = e.toLowerCase();
-    if (JUNK_EMAIL_PREFIXES.some((p) => lower.startsWith(p) || lower.includes(p))) return false;
-    if (JUNK_EMAIL_DOMAINS.some((d) => lower.endsWith(`@${d}`))) return false;
-    return true;
-  }))];
-}
-
-function extractEmails(text: string): string[] {
-  return filterEmails(text.match(EMAIL_RE) ?? []);
-}
-
-// Also extract emails from mailto: href attributes — many sites put emails
-// only in <a href="mailto:..."> with no visible text (icon links, etc.)
-function extractEmailsFromHtml(html: string): string[] {
-  if (!html) return [];
-  const $ = cheerio.load(html);
-  const found: string[] = [];
-  $('a[href^="mailto:"], a[href^="MAILTO:"]').each((_i, el) => {
-    const href = $(el).attr('href') ?? '';
-    const email = href.replace(/^mailto:/i, '').split('?')[0].trim();
-    if (EMAIL_RE.test(email)) found.push(email);
-    EMAIL_RE.lastIndex = 0; // reset stateful regex
-  });
-  return filterEmails(found);
-}
-
-// Some sites obfuscate emails by splitting the local-part and domain across
-// sibling elements with a <br> or other tag in between, e.g.:
-//   <div>contacts@<br /></div><div>volasoftware.com</div>
-// The regex matches: localpart@ + any HTML tags/whitespace + domain.tld
-const SPLIT_EMAIL_RE = /([a-zA-Z0-9._%+\-]+@)(?:<[^>]*>\s*|\s)+([a-zA-Z0-9.\-]+\.[a-zA-Z]{2,})/g;
-
-function extractSplitEmails(html: string): string[] {
-  if (!html) return [];
-  const found: string[] = [];
-  let m: RegExpExecArray | null;
-  while ((m = SPLIT_EMAIL_RE.exec(html)) !== null) {
-    const email = m[1] + m[2];
-    EMAIL_RE.lastIndex = 0;
-    if (EMAIL_RE.test(email)) found.push(email);
-    EMAIL_RE.lastIndex = 0;
-  }
-  return filterEmails(found);
-}
-
-function mergeEmails(text: string, html: string): string[] {
-  return [...new Set([
-    ...extractEmails(text),
-    ...extractEmailsFromHtml(html),
-    ...extractSplitEmails(html),
-  ])];
-}
-
-function extractPhones(text: string): string[] {
-  const raw = text.match(PHONE_RE) ?? [];
-  const phones = [...new Set(raw
-    .map((p) => p.trim())
-    .filter((p) => {
-      const digits = p.replace(/\D/g, '');
-      // Must have 7–15 digits
-      if (digits.length < 7 || digits.length > 15) return false;
-      // Reject date patterns: dd.mm.yyyy or dd-mm-yyyy
-      if (/^\d{1,2}[.\-/]\d{1,2}[.\-/]\d{2,4}$/.test(p)) return false;
-      // Reject decimal numbers (coordinates, prices): e.g. 226.5000
-      if (/^\d+\.\d+$/.test(p)) return false;
-      // Reject anything starting with a year (20xx...)
-      if (/^(19|20)\d{2}/.test(digits)) return false;
-      // Reject IPv4 addresses (e.g. 088.143.253.143)
-      if (/^\d+\.\d+\.\d+\.\d+$/.test(p.trim())) return false;
-      // Bulgarian numbers only: must start with +359 or 08
-      const normalized = p.replace(/[\s\-.()/]/g, '');
-      if (!normalized.startsWith('+359') && !normalized.startsWith('08')) return false;
-      return true;
-    })
-  )];
-  return phones;
-}
 
 function extractNavLinks($: cheerio.CheerioAPI, baseUrl: string): string[] {
   const links: string[] = [];
-  $('nav a, header a').each((_i, el) => {
+  // Include footer and ARIA-role navigation — many Bulgarian sites skip the <nav> element
+  $('nav a, header a, footer a, [role="navigation"] a').each((_i, el) => {
     const href = $(el).attr('href');
     if (!href) return;
     try {
@@ -138,6 +61,116 @@ function extractNavLinks($: cheerio.CheerioAPI, baseUrl: string): string[] {
     } catch { /* ignore */ }
   });
   return [...new Set(links)].slice(0, 10);
+}
+
+// Strip trailing slash so /contacts/ and /contacts deduplicate correctly in the Set.
+function normalizeUrl(url: string): string {
+  return url.length > 1 && url.endsWith('/') ? url.slice(0, -1) : url;
+}
+
+// Detects the contact page URL by matching anchor text or href path against contact
+// keywords — handles language-prefixed paths like /en/contacts that fall outside the
+// nav link slice window and would otherwise be missed entirely.
+const CONTACT_KEYWORD_RE = /contact|kontakti?|контакти?/i;
+
+// Detects team/about/leadership pages by anchor text or href — same motivation as above.
+const TEAM_KEYWORD_RE = /\b(?:team|about|ekip|leadership|management|people|staff)\b|за[\s\-]нас|за[\s\-]фирмата|екип|ръководство|управлени[ея]|собственици/i;
+
+function extractTeamPageLinks($: cheerio.CheerioAPI, baseUrl: string): string[] {
+  const found: string[] = [];
+  $('a[href]').each((_i, el) => {
+    const href = $(el).attr('href') ?? '';
+    if (!href) return;
+    const text = $(el).text().trim();
+    if (!TEAM_KEYWORD_RE.test(href) && !TEAM_KEYWORD_RE.test(text)) return;
+    try {
+      const parsed = new URL(href, baseUrl);
+      if (!parsed.href.startsWith(baseUrl)) return;
+      parsed.hash = '';
+      const clean = parsed.href;
+      if (clean === baseUrl || clean === baseUrl + '/') return;
+      found.push(clean);
+    } catch { /* ignore */ }
+  });
+  return [...new Set(found)].slice(0, 5);
+}
+
+function extractContactPageLinks($: cheerio.CheerioAPI, baseUrl: string): string[] {
+  const found: string[] = [];
+  $('a[href]').each((_i, el) => {
+    const href = $(el).attr('href') ?? '';
+    if (!href) return;
+    const text = $(el).text().trim();
+    if (!CONTACT_KEYWORD_RE.test(href) && !CONTACT_KEYWORD_RE.test(text)) return;
+    try {
+      const parsed = new URL(href, baseUrl);
+      if (!parsed.href.startsWith(baseUrl)) return;
+      parsed.hash = '';
+      const clean = parsed.href;
+      if (clean === baseUrl || clean === baseUrl + '/') return;
+      found.push(clean);
+    } catch { /* ignore */ }
+  });
+  return [...new Set(found)].slice(0, 3);
+}
+
+// ── URL queue builder ────────────────────────────────────────────────────────
+// Exported so it can be unit-tested without importing crawlee / playwright.
+
+export interface UrlQueueResult {
+  /** All URLs to visit in the second pass, deduplicated and capped at 18. */
+  urlsToVisit: string[];
+  /** Team / about / management links discovered via anchor text/href in the page. */
+  discoveredTeamLinks: string[];
+  /** Contact page links discovered via anchor text/href. */
+  discoveredContactLinks: string[];
+  /**
+   * TEAM_PATHS fallback guesses appended to the queue.
+   * Empty when at least one team link was discovered naturally.
+   */
+  fallbackTeamLinks: string[];
+  /**
+   * CONTACT_PATHS fallback guesses appended to the queue.
+   * Empty when at least one contact link was discovered naturally.
+   */
+  fallbackContactLinks: string[];
+}
+
+/**
+ * Builds the second-pass URL queue from parsed homepage HTML.
+ *
+ * Priority order for team URLs:
+ *   1. Links discovered via nav/anchor text (discoveredTeamLinks)
+ *   2. TEAM_PATHS fallbacks — only when nothing was discovered naturally
+ *
+ * Same principle applies to contact pages. This prevents unnecessary 404
+ * requests on sites where generic paths like /team or /about don't exist.
+ */
+export function buildUrlQueue(homepageHtml: string, baseUrl: string): UrlQueueResult {
+  const $ = cheerio.load(homepageHtml);
+  const navLinks              = extractNavLinks($, baseUrl);
+  const discoveredContactLinks = extractContactPageLinks($, baseUrl);
+  const discoveredTeamLinks   = extractTeamPageLinks($, baseUrl);
+
+  // Only fall back to guessed paths when the real page wasn't discovered.
+  const fallbackContactLinks = discoveredContactLinks.length === 0
+    ? CONTACT_PATHS.map((p) => `${baseUrl}${p}`)
+    : [];
+  const fallbackTeamLinks = discoveredTeamLinks.length === 0
+    ? TEAM_PATHS.map((p) => `${baseUrl}${p}`)
+    : [];
+  const miscFallbacks = FALLBACK_PATHS.map((p) => `${baseUrl}${p}`);
+
+  const urlsToVisit = [...new Set([
+    ...discoveredContactLinks,
+    ...discoveredTeamLinks,
+    ...navLinks,
+    ...fallbackContactLinks,
+    ...fallbackTeamLinks,
+    ...miscFallbacks,
+  ].map(normalizeUrl))].slice(0, 18);
+
+  return { urlsToVisit, discoveredTeamLinks, discoveredContactLinks, fallbackTeamLinks, fallbackContactLinks };
 }
 
 function makeConfig(): Configuration {
@@ -165,12 +198,16 @@ async function crawlWithCheerio(baseUrl: string): Promise<CrawledPage[]> {
         const text = pageText($ as unknown as cheerio.CheerioAPI);
         const emails = mergeEmails(text, homepageHtml);
         const phones = extractPhones(text);
+        const { loginProtected } = detectLoginPage(homepageHtml, text);
+        const logoUrls = loginProtected ? extractLogoUrls(homepageHtml, baseUrl) : [];
         pages.push({
           url: request.url,
           text,
           html: homepageHtml,
           emails,
           phones,
+          loginProtected,
+          logoUrls,
         });
       },
       failedRequestHandler({ request, log }) {
@@ -183,10 +220,17 @@ async function crawlWithCheerio(baseUrl: string): Promise<CrawledPage[]> {
   await firstPass.run([baseUrl]);
   if (pages.length === 0) return pages;
 
-  const $ = cheerio.load(homepageHtml);
-  const navLinks = extractNavLinks($, baseUrl);
-  const fallbackLinks = FALLBACK_PATHS.map((p) => `${baseUrl}${p}`);
-  const urlsToVisit = [...new Set([...navLinks, ...fallbackLinks])].slice(0, 12);
+  const queue = buildUrlQueue(homepageHtml, baseUrl);
+  const { urlsToVisit } = queue;
+  console.log(
+    `[crawl] ${baseUrl}` +
+    ` discoveredTeamLinks=${JSON.stringify(queue.discoveredTeamLinks)}` +
+    ` discoveredContactLinks=${JSON.stringify(queue.discoveredContactLinks)}` +
+    (queue.fallbackTeamLinks.length > 0
+      ? ` fallbackTeamLinks=${queue.fallbackTeamLinks.length}paths`
+      : ' fallbackTeamLinks=skipped(discovered)') +
+    ` urlsToVisit(${urlsToVisit.length})=${JSON.stringify(urlsToVisit)}`
+  );
 
   const secondPass = new CheerioCrawler(
     {
@@ -198,12 +242,17 @@ async function crawlWithCheerio(baseUrl: string): Promise<CrawledPage[]> {
         const html = $.html();
         const emails = mergeEmails(text, html);
         const phones = extractPhones(text);
+        const { loginProtected } = detectLoginPage(html, text);
+        const logoUrls = loginProtected ? extractLogoUrls(html, baseUrl) : [];
+        console.log(`[crawl:page] ${request.url} — emails(${emails.length})=${JSON.stringify(emails)}`);
         pages.push({
           url: request.url,
           text,
           html: shouldSaveHtml(request.url) ? html : '',
           emails,
           phones,
+          loginProtected,
+          logoUrls,
         });
       },
       failedRequestHandler() { /* silent */ },
@@ -212,6 +261,19 @@ async function crawlWithCheerio(baseUrl: string): Promise<CrawledPage[]> {
   );
 
   await secondPass.run(urlsToVisit);
+
+  // Fallback hit/miss metrics — only logged when fallbacks were actually used.
+  if (queue.fallbackTeamLinks.length > 0) {
+    const fallbackSet = new Set(queue.fallbackTeamLinks.map(normalizeUrl));
+    const hits = pages.filter((p) => fallbackSet.has(normalizeUrl(p.url)) && p.text.trim().length > 200).length;
+    console.log(
+      `[crawl:metrics] ${baseUrl}` +
+      ` fallbackTeamAttempts=${queue.fallbackTeamLinks.length}` +
+      ` fallbackTeamHits=${hits}` +
+      ` fallbackTeamMisses=${queue.fallbackTeamLinks.length - hits}`
+    );
+  }
+
   return pages;
 }
 
@@ -229,14 +291,32 @@ async function crawlWithPlaywright(baseUrl: string): Promise<CrawledPage[]> {
         const html = await page.content();
         const text = await page.evaluate(() => document.body.innerText);
         homepageHtml = html;
-        const emails = mergeEmails(text, html);
+        // Collect same-origin frame content — iframes on contact pages sometimes
+        // contain the actual contact details rendered by a CMS widget.
+        const origin = new URL(baseUrl).origin;
+        const frameHtmlChunks: string[] = [];
+        for (const frame of page.frames().slice(1)) {
+          try {
+            if (!frame.url().startsWith(origin)) continue;
+            const fh = await frame.content().catch(() => '');
+            if (fh) frameHtmlChunks.push(fh);
+          } catch { /* ignore sandboxed / detached frames */ }
+        }
+        const combinedHtml = frameHtmlChunks.length > 0
+          ? html + '\n' + frameHtmlChunks.join('\n')
+          : html;
+        const emails = mergeEmails(text, combinedHtml);
         const phones = extractPhones(text);
+        const { loginProtected } = detectLoginPage(html, text);
+        const logoUrls = loginProtected ? extractLogoUrls(html, baseUrl) : [];
         pages.push({
           url: request.url,
           text,
           html,
           emails,
           phones,
+          loginProtected,
+          logoUrls,
         });
       },
       failedRequestHandler({ request, log }) {
@@ -249,10 +329,17 @@ async function crawlWithPlaywright(baseUrl: string): Promise<CrawledPage[]> {
   await firstPass.run([baseUrl]);
   if (pages.length === 0 || !homepageHtml) return pages;
 
-  const $ = cheerio.load(homepageHtml);
-  const navLinks = extractNavLinks($, baseUrl);
-  const fallbackLinks = FALLBACK_PATHS.map((p) => `${baseUrl}${p}`);
-  const urlsToVisit = [...new Set([...navLinks, ...fallbackLinks])].slice(0, 12);
+  const queue = buildUrlQueue(homepageHtml, baseUrl);
+  const { urlsToVisit } = queue;
+  console.log(
+    `[crawl:playwright] ${baseUrl}` +
+    ` discoveredTeamLinks=${JSON.stringify(queue.discoveredTeamLinks)}` +
+    ` discoveredContactLinks=${JSON.stringify(queue.discoveredContactLinks)}` +
+    (queue.fallbackTeamLinks.length > 0
+      ? ` fallbackTeamLinks=${queue.fallbackTeamLinks.length}paths`
+      : ' fallbackTeamLinks=skipped(discovered)') +
+    ` urlsToVisit(${urlsToVisit.length})=${JSON.stringify(urlsToVisit)}`
+  );
 
   const secondPass = new PlaywrightCrawler(
     {
@@ -264,14 +351,31 @@ async function crawlWithPlaywright(baseUrl: string): Promise<CrawledPage[]> {
         await page.waitForLoadState('networkidle', { timeout: 10000 }).catch(() => {});
         const text = await page.evaluate(() => document.body.innerText);
         const html = await page.content();
-        const emails = mergeEmails(text, html);
+        const origin = new URL(baseUrl).origin;
+        const frameHtmlChunks: string[] = [];
+        for (const frame of page.frames().slice(1)) {
+          try {
+            if (!frame.url().startsWith(origin)) continue;
+            const fh = await frame.content().catch(() => '');
+            if (fh) frameHtmlChunks.push(fh);
+          } catch { /* ignore sandboxed / detached frames */ }
+        }
+        const combinedHtml = frameHtmlChunks.length > 0
+          ? html + '\n' + frameHtmlChunks.join('\n')
+          : html;
+        const emails = mergeEmails(text, combinedHtml);
         const phones = extractPhones(text);
+        const { loginProtected } = detectLoginPage(html, text);
+        const logoUrls = loginProtected ? extractLogoUrls(html, baseUrl) : [];
+        console.log(`[crawl:playwright:page] ${request.url} — emails(${emails.length})=${JSON.stringify(emails)}`);
         pages.push({
           url: request.url,
           text,
           html: shouldSaveHtml(request.url) ? html : '',
           emails,
           phones,
+          loginProtected,
+          logoUrls,
         });
       },
       failedRequestHandler() { /* silent */ },
@@ -280,6 +384,18 @@ async function crawlWithPlaywright(baseUrl: string): Promise<CrawledPage[]> {
   );
 
   await secondPass.run(urlsToVisit);
+
+  if (queue.fallbackTeamLinks.length > 0) {
+    const fallbackSet = new Set(queue.fallbackTeamLinks.map(normalizeUrl));
+    const hits = pages.filter((p) => fallbackSet.has(normalizeUrl(p.url)) && p.text.trim().length > 200).length;
+    console.log(
+      `[crawl:metrics] ${baseUrl}` +
+      ` fallbackTeamAttempts=${queue.fallbackTeamLinks.length}` +
+      ` fallbackTeamHits=${hits}` +
+      ` fallbackTeamMisses=${queue.fallbackTeamLinks.length - hits}`
+    );
+  }
+
   return pages;
 }
 
@@ -339,7 +455,7 @@ async function fetchForBotCheck(url: string): Promise<CrawledPage | null> {
     if (!html) return null;
     const $ = cheerio.load(html);
     const text = pageText($);
-    const candidate: CrawledPage = { url, text, html, emails: [], phones: [] };
+    const candidate: CrawledPage = { url, text, html, emails: [], phones: [], loginProtected: false, logoUrls: [] };
     const { blocked } = detectBotProtection([candidate]);
     return blocked ? candidate : null;
   } catch {

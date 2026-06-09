@@ -2,8 +2,9 @@ import 'dotenv/config';
 import { getQueue, QUEUES, CrawlCompanyPayload, DiscoverPersonaPayload, PersonalizeCompanyPayload, enqueueCrawlJob, enqueuePersonalizeJob, stopQueue } from '../lib/queue';
 import { prisma } from '../lib/prisma';
 import { crawlCompany, detectBotProtection, BOT_CRAWL_NOTE } from './crawl';
-import { extractProfile } from '../services/extraction';
+import { extractProfile, isGenericAuthName } from '../services/extraction';
 import { enrichSocialLinks } from '../services/socialEnrichment';
+import { runLoginFallbackEnrichment } from '../services/loginFallbackEnrichment';
 import { discoverSites, SearchProviderError } from '../services/discovery';
 import { checkFreshness } from '../lib/freshness';
 import { generatePersonalizedContent } from '../services/personalization';
@@ -68,6 +69,8 @@ async function processSingleJob(job: PgBoss.JobWithMetadata<CrawlCompanyPayload>
     // 3. Extract processed profile
     const profile = extractProfile(pages);
 
+    console.log(`[worker:profile] ${domain} — pages(${pages.length})=${JSON.stringify(pages.map(p => p.url))} emails(${profile.emails.length})=${JSON.stringify(profile.emails)}`);
+
     // 3b. Enrich missing social links from search (best-effort, non-critical)
     try {
       const enrichedSocial = await enrichSocialLinks(profile, domain);
@@ -78,64 +81,149 @@ async function processSingleJob(job: PgBoss.JobWithMetadata<CrawlCompanyPayload>
       }
     } catch { /* non-critical */ }
 
-    // 4. Upsert CompanyProfile
+    // 3c. Login-page fallback enrichment — when normal extraction yielded very little
+    // (score < 30 or no name) and the homepage is a login wall, use the visible logo
+    // to identify the company and discover social profiles via secondary search.
+    const isLoginProtected = pages.some((p) => p.loginProtected);
+    let loginFallback: Awaited<ReturnType<typeof runLoginFallbackEnrichment>> | null = null;
+
+    // Treat a generic auth title ("login", "вход", "portal" …) the same as a missing name:
+    // the page title of a login wall is never a real company name.
+    const nameIsMissingOrGeneric = !profile.name || isGenericAuthName(profile.name);
+
+    if (isLoginProtected && (profile.completionScore < 30 || nameIsMissingOrGeneric)) {
+      try {
+        loginFallback = await runLoginFallbackEnrichment(pages, domain);
+        console.log(
+          `[worker:login-fallback] ${domain} — name="${loginFallback.companyNameFromLogo ?? 'n/a'}" ` +
+          `confidence=${loginFallback.logoNameConfidence}`,
+        );
+        // Merge fallback data into live profile.
+        // Allow OCR name to replace a generic auth title (e.g. "login" → "Walltopia").
+        if (nameIsMissingOrGeneric && loginFallback.enrichedName)
+          profile.name = loginFallback.enrichedName;
+        if (!profile.description && loginFallback.enrichedDescription)
+          profile.description = loginFallback.enrichedDescription;
+        if (Object.keys(loginFallback.enrichedSocialLinks).length > 0)
+          profile.socialLinks = { ...loginFallback.enrichedSocialLinks, ...profile.socialLinks };
+        profile.completionScore = Math.min(100, profile.completionScore + loginFallback.scoreBonus);
+      } catch { /* non-critical — fallback must never break the crawl pipeline */ }
+    }
+
+    // 4. Upsert CompanyProfile — preserve existing emails/phones if the new crawl found none.
+    // A retry crawl that misses the contact page must not overwrite verified contact data.
+    const existingProfile = await prisma.companyProfile.findUnique({
+      where: { companyId },
+      select: { emails: true, phones: true, name: true },
+    });
+    const existingEmails = Array.isArray(existingProfile?.emails) ? existingProfile.emails as string[] : [];
+    const existingPhones = Array.isArray(existingProfile?.phones) ? existingProfile.phones as string[] : [];
+    // Name resolution: new crawl wins; if it found nothing, preserve an existing real name
+    // but explicitly null out a stale generic auth name (Prisma ignores `undefined` on update,
+    // so we must pass `null` to actually clear a "login" / "вход" / "portal" value).
+    const existingName = existingProfile?.name as string | null | undefined;
+    const upsertName = profile.name != null
+      ? profile.name
+      : isGenericAuthName(existingName) ? null : (existingName ?? null);
+    const upsertEmails = profile.emails.length > 0 ? profile.emails : existingEmails;
+    const upsertPhones = profile.phones.length > 0 ? profile.phones : existingPhones;
+    // Adjust score if falling back to preserved contact data
+    let upsertScore = profile.completionScore;
+    if (upsertEmails.length > 0 && profile.emails.length === 0) upsertScore = Math.min(100, upsertScore + 15);
+    if (upsertPhones.length > 0 && profile.phones.length === 0) upsertScore = Math.min(100, upsertScore + 10);
+
     await prisma.companyProfile.upsert({
       where: { companyId },
       create: {
         companyId,
-        name: profile.name,
+        name: upsertName,
         description: profile.description,
         location: profile.location,
-        emails: profile.emails,
-        phones: profile.phones,
+        emails: upsertEmails,
+        phones: upsertPhones,
         services: profile.services,
         team: profile.team as unknown as import('@prisma/client').Prisma.InputJsonValue,
         history: profile.history,
         socialLinks: profile.socialLinks,
-        completionScore: profile.completionScore,
+        completionScore: upsertScore,
+        loginProtected:      isLoginProtected,
+        logoSourceUrl:       loginFallback?.logoSourceUrl       ?? undefined,
+        companyNameFromLogo: loginFallback?.companyNameFromLogo ?? undefined,
+        sloganFromLogo:      loginFallback?.sloganFromLogo      ?? undefined,
+        logoNameConfidence:  loginFallback?.logoNameConfidence  ?? 0,
       },
       update: {
-        name: profile.name,
+        name: upsertName,
         description: profile.description,
         location: profile.location,
-        emails: profile.emails,
-        phones: profile.phones,
+        emails: upsertEmails,
+        phones: upsertPhones,
         services: profile.services,
         team: profile.team as unknown as import('@prisma/client').Prisma.InputJsonValue,
         history: profile.history,
         socialLinks: profile.socialLinks,
-        completionScore: profile.completionScore,
+        completionScore: upsertScore,
+        loginProtected:      isLoginProtected,
+        logoSourceUrl:       loginFallback?.logoSourceUrl       ?? undefined,
+        companyNameFromLogo: loginFallback?.companyNameFromLogo ?? undefined,
+        sloganFromLogo:      loginFallback?.sloganFromLogo      ?? undefined,
+        logoNameConfidence:  loginFallback?.logoNameConfidence  ?? 0,
       },
     });
 
     // 5. Update company status
     await prisma.company.update({
       where: { id: companyId },
-      data: { crawlStatus: 'COMPLETED', lastCrawledAt: new Date(), name: profile.name },
+      data: { crawlStatus: 'COMPLETED', lastCrawledAt: new Date(), name: upsertName },
     });
 
-    console.log(`[worker] done ${domain} — score: ${profile.completionScore}`);
+    console.log(`[worker] done ${domain} — score: ${upsertScore}`);
     await updateBatchProgress(batchId);
 
-    // 6. Enqueue personalization — separate queue with lower concurrency for Groq rate limits
-    const pQueue = await getQueue();
-    await enqueuePersonalizeJob({ companyId }, pQueue);
+    // 6. Enqueue personalization — best-effort; failure must not cause a crawl retry or FAILED status
+    try {
+      const pQueue = await getQueue();
+      await enqueuePersonalizeJob({ companyId }, pQueue);
+    } catch (personErr) {
+      console.error(`[worker] personalize enqueue failed for ${domain}:`, personErr);
+    }
   } catch (err) {
     console.error(`[worker] failed ${domain}:`, err);
 
     const retryLimit = 3;
     const isFinalAttempt = (job.retryCount ?? 0) >= retryLimit - 1;
 
-    // Use updateMany with a guard so a stale/concurrent retry job never downgrades
-    // a company that was already successfully completed by a parallel job.
-    await prisma.company.updateMany({
-      where: { id: companyId, crawlStatus: { not: 'COMPLETED' } },
-      data: { crawlStatus: isFinalAttempt ? 'FAILED' : 'PENDING' },
-    });
-
-    // Only count toward batch progress on the final failure, not each retry
     if (isFinalAttempt) {
+      // On the final attempt, mark COMPLETED if a useful profile was already saved —
+      // e.g. the crawl succeeded but a downstream step (personalization enqueue,
+      // batch progress) failed on every retry attempt.
+      const saved = await prisma.companyProfile.findUnique({
+        where: { companyId },
+        select: { emails: true, phones: true, completionScore: true, loginProtected: true, companyNameFromLogo: true },
+      }).catch(() => null);
+      const hasUsefulData = saved && (
+        (Array.isArray(saved.emails) && (saved.emails as string[]).length > 0) ||
+        (Array.isArray(saved.phones) && (saved.phones as string[]).length > 0) ||
+        (saved.completionScore >= 50) ||
+        // Login-protected site where we successfully recovered identity from the logo
+        (saved.loginProtected && !!saved.companyNameFromLogo)
+      );
+      const finalStatus = hasUsefulData ? 'COMPLETED' : 'FAILED';
+      console.log(`[worker] final attempt ${domain} — profile hasUsefulData=${hasUsefulData} → ${finalStatus}`);
+      // Guard prevents downgrading a parallel COMPLETED result
+      await prisma.company.updateMany({
+        where: { id: companyId, crawlStatus: { not: 'COMPLETED' } },
+        data: {
+          crawlStatus: finalStatus,
+          ...(hasUsefulData ? { lastCrawledAt: new Date() } : {}),
+        },
+      });
       await updateBatchProgress(batchId);
+    } else {
+      await prisma.company.updateMany({
+        where: { id: companyId, crawlStatus: { not: 'COMPLETED' } },
+        data: { crawlStatus: 'PENDING' },
+      });
     }
 
     throw err; // Let pg-boss handle retry

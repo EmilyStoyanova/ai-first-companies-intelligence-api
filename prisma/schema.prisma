@@ -96,19 +96,24 @@ model RawCompanyProfile {
 }
 
 model CompanyProfile {
-  id              String   @id @default(uuid())
-  companyId       String   @unique
-  name            String?
-  description     String?
-  location        String?
-  emails          Json     @default("[]")
-  phones          Json     @default("[]")
-  services        Json     @default("[]")
-  team            Json     @default("[]")
-  history         String?
-  socialLinks     Json     @default("{}")
-  completionScore Float    @default(0)
-  updatedAt       DateTime @updatedAt
+  id                  String   @id @default(uuid())
+  companyId           String   @unique
+  name                String?
+  description         String?
+  location            String?
+  emails              Json     @default("[]")
+  phones              Json     @default("[]")
+  services            Json     @default("[]")
+  team                Json     @default("[]")
+  history             String?
+  socialLinks         Json     @default("{}")
+  completionScore     Float    @default(0)
+  loginProtected      Boolean  @default(false)
+  logoSourceUrl       String?
+  companyNameFromLogo String?
+  sloganFromLogo      String?
+  logoNameConfidence  Int      @default(0)
+  updatedAt           DateTime @updatedAt
 
   company Company @relation(fields: [companyId], references: [id])
 }

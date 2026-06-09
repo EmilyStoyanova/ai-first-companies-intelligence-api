@@ -1,8 +1,9 @@
 import * as cheerio from 'cheerio';
 import { CrawledPage } from '../worker/crawl';
+import { normalizePhone, canonicalizePhone } from '../lib/phoneExtraction';
 
 export interface TeamMember {
-  name: string;
+  name?: string;
   position?: string;
   email?: string;
   linkedin?: string;
@@ -152,23 +153,131 @@ function extractSocialLinks(pages: CrawledPage[]): Record<string, string> {
 // Titles that are bot-protection or server error pages, never real company names.
 const BLOCKED_TITLE_RE = /^(just a moment|access denied|403 forbidden|security check|bot check|human verification|please wait|ddos protection|attention required)\s*\.{0,3}$/i;
 
+// Exact (normalised) strings that are generic authentication or navigation page
+// titles, not company names.  Normalisation: lowercase, trim, collapse
+// hyphens/underscores/spaces to a single space before lookup.
+const GENERIC_AUTH_NAME_SET = new Set([
+  'login', 'log in', 'sign in', 'signin', 'sign-in',
+  'вход', 'влизане',
+  'portal', 'customer portal', 'client portal', 'dealer portal', 'user portal',
+  'customer area', 'client area', 'member area', 'dealer area',
+  'my account', 'account',
+  'welcome',
+  'dashboard',
+  'forgot password', 'reset password', 'forgot your password',
+  'authentication', 'auth',
+  'secure login', 'user login', 'admin login', 'admin',
+  'access', 'access denied',
+  // Generic home / landing page labels (Latin)
+  'home', 'home page', 'homepage',
+  'index', 'index page',
+  'main', 'main page',
+  'landing', 'landing page',
+  'start', 'start page',
+  'untitled', 'untitled document', 'new page',
+  // Generic home / landing page labels (Cyrillic Bulgarian)
+  'начална страница',   // "Home page"
+  'начало',             // "Home" / "Start"
+  'добре дошли',        // "Welcome"
+  'добре дошли!',
+  // Language-switcher button text extracted as site name
+  'english version', 'bg version', 'en version', 'bg', 'en',
+]);
+
+// Returns true when the string is a generic auth/page label that can never
+// be a real company name.  Safe to call with null/undefined.
+export function isGenericAuthName(name?: string | null): boolean {
+  if (!name) return false;
+  const normalised = name
+    .toLowerCase()
+    .trim()
+    .replace(/[-_]+/g, ' ')
+    .replace(/\s+/g, ' ');
+  return GENERIC_AUTH_NAME_SET.has(normalised);
+}
+
+// Extracts a company-name candidate from the first plausible logo <img> alt text.
+// Tries progressively broader logo-selector patterns; skips strings that are
+// self-descriptions of the image ("logo", "site logo", "CrossCycle logo", …).
+function extractLogoAlt($: cheerio.CheerioAPI): string | undefined {
+  const selectors = [
+    'a[class*="logo"] img',
+    'a[id*="logo"] img',
+    'img[class*="logo"]',
+    'img[id*="logo"]',
+    '.site-logo img, #site-logo img',
+    'header a img:first-child',
+  ];
+  for (const sel of selectors) {
+    let found: string | undefined;
+    $(sel).each((_i, el) => {
+      if (found) return;
+      const raw = ($(el).attr('alt') ?? '').trim();
+      // Take only the first segment when the alt has a separator ("Brand — tagline")
+      const alt = raw.split(/[|\-–]/)[0].trim();
+      if (!alt || alt.length < 2 || alt.length > 80) return;
+      // Reject self-descriptions of the image
+      if (/^(logo|icon|image|img|banner|site logo|company logo|header logo)$/i.test(alt)) return;
+      if (/\s+(logo|icon)$/i.test(alt)) return; // "CrossCycle Logo" → skip
+      if (/\.(png|jpg|gif|svg|webp|ico)$/i.test(alt)) return; // filename in alt
+      if (isGenericAuthName(alt)) return;
+      found = alt;
+    });
+    if (found) return found;
+  }
+  return undefined;
+}
+
+// Short segments that appear in domain bodies but are not part of a company name
+// (country codes, legal suffixes, generic words).
+const DOMAIN_NOISE_WORDS = new Set([
+  'bg', 'eu', 'uk', 'us', 'de', 'fr', 'ro', 'mk', 'rs', 'gr',
+  'ltd', 'llc', 'inc', 'gmbh', 'ood', 'eood', 'ad', 'web', 'site',
+]);
+
+// Derives a readable company name from the homepage URL when all richer sources
+// have been exhausted.  "tashev-trans.bg" → "Tashev Trans".
+function extractDomainName(url: string): string | undefined {
+  try {
+    const hostname = new URL(url).hostname.replace(/^www\./, '');
+    const domainBody = hostname.split('.')[0]; // "crosscycle" from "crosscycle.bg"
+    if (!domainBody || domainBody.length < 3) return undefined;
+    const parts = domainBody
+      .split(/[-_]/)
+      .filter((w) => w.length >= 2 && !DOMAIN_NOISE_WORDS.has(w.toLowerCase()));
+    if (parts.length === 0) return undefined;
+    return parts
+      .map((w) => w.charAt(0).toUpperCase() + w.slice(1).toLowerCase())
+      .join(' ');
+  } catch {
+    return undefined;
+  }
+}
+
 function extractCompanyName(pages: CrawledPage[]): string | undefined {
   const homepage = pages[0];
   if (!homepage?.html) return undefined;
 
   const $ = cheerio.load(homepage.html);
 
-  const ogSite = $('meta[property="og:site_name"]').attr('content');
-  if (ogSite) return ogSite.trim();
+  // Priority 1: og:site_name — most authoritative, set explicitly by the CMS
+  const ogSite = $('meta[property="og:site_name"]').attr('content')?.trim();
+  if (ogSite && !BLOCKED_TITLE_RE.test(ogSite) && !isGenericAuthName(ogSite)) return ogSite;
 
+  // Priority 2: <title> first segment (text before | or -)
   const title = $('title').text().trim();
   if (title) {
     const candidate = title.split(/[|\-–]/)[0].trim();
-    if (BLOCKED_TITLE_RE.test(candidate)) return undefined;
-    return candidate;
+    if (!BLOCKED_TITLE_RE.test(candidate) && !isGenericAuthName(candidate)) return candidate;
   }
 
-  return undefined;
+  // Priority 3: logo alt text — sites that set title to a generic value often
+  // have a properly-labelled logo image
+  const logoAlt = extractLogoAlt($);
+  if (logoAlt) return logoAlt;
+
+  // Priority 4: domain-derived name — last resort, better than undefined
+  return extractDomainName(homepage.url);
 }
 
 // ── Description ───────────────────────────────────────────────────────────────
@@ -179,17 +288,11 @@ function extractDescription(pages: CrawledPage[]): string | undefined {
 
   const $ = cheerio.load(homepage.html);
 
-  const MAX_DESC = 300;
-
   const metaDesc = $('meta[name="description"]').attr('content')?.trim();
-  if (metaDesc && metaDesc.length > 20) {
-    return metaDesc.length > MAX_DESC ? metaDesc.slice(0, MAX_DESC).trimEnd() + '…' : metaDesc;
-  }
+  if (metaDesc && metaDesc.length > 20) return metaDesc;
 
   const ogDesc = $('meta[property="og:description"]').attr('content')?.trim();
-  if (ogDesc && ogDesc.length > 20) {
-    return ogDesc.length > MAX_DESC ? ogDesc.slice(0, MAX_DESC).trimEnd() + '…' : ogDesc;
-  }
+  if (ogDesc && ogDesc.length > 20) return ogDesc;
 
   let fallback = '';
   $('p').each((_i, el) => {
@@ -197,8 +300,7 @@ function extractDescription(pages: CrawledPage[]): string | undefined {
     if (!fallback && t.length > 60) fallback = t;
   });
 
-  if (!fallback) return undefined;
-  return fallback.length > MAX_DESC ? fallback.slice(0, MAX_DESC).trimEnd() + '…' : fallback;
+  return fallback || undefined;
 }
 
 // ── Location ──────────────────────────────────────────────────────────────────
@@ -326,6 +428,16 @@ function normalizeTitle(raw: string): string {
   return raw.replace(/\s+/g, ' ').trim();
 }
 
+// Strings that are never real service names — test/debug entries, CMS render
+// failures, JS placeholder values, and UI loading/error states.
+// Anchored (^ $) so "Error handling" or "Testing strategy" are not rejected.
+const JUNK_SERVICE_RE =
+  /^(?:test\s*\d*|demo|placeholder|sample|example|lorem(?:\s+ipsum)?|debug|undefined|null|nan|n\/a|error[:\s!.…]*|warning[:\s!.…]*|loading[.…]*)$/i;
+
+export function isJunkService(s: string): boolean {
+  return JUNK_SERVICE_RE.test(s.trim());
+}
+
 function extractServicesFromHtml(pages: CrawledPage[]): Set<string> {
   const items = new Set<string>();
 
@@ -341,14 +453,14 @@ function extractServicesFromHtml(pages: CrawledPage[]): Set<string> {
       // Adjacent <ul>/<ol>
       $(el).nextAll('ul, ol').first().find('li').each((_j, li) => {
         const t = normalizeTitle($(li).clone().children('ul, ol').remove().end().text());
-        if (t.length > 2 && t.length < 120) items.add(t);
+        if (t.length > 2 && t.length < 120 && !isJunkService(t)) items.add(t);
       });
 
       // Cards/headings inside the nearest section/div container
       $(el).closest('section, div[class]').find('h3, h4, [class*="card"] h3, [class*="service"] h4, [class*="item"] h4').each((_j, card) => {
         if (card === el) return;
         const t = normalizeTitle($(card).text());
-        if (t.length > 2 && t.length < 120 && !SERVICE_CONTEXT_RE.test(t.toLowerCase())) items.add(t);
+        if (t.length > 2 && t.length < 120 && !SERVICE_CONTEXT_RE.test(t.toLowerCase()) && !isJunkService(t)) items.add(t);
       });
     });
 
@@ -357,7 +469,7 @@ function extractServicesFromHtml(pages: CrawledPage[]): Set<string> {
       // Skip the outer wrapper (it would grab the section heading)
       if ($(el).find('[class*="service"],[class*="card"],[class*="item"]').length > 2) return;
       const title = normalizeTitle($(el).find('h2, h3, h4, strong').first().text());
-      if (title.length > 2 && title.length < 120) items.add(title);
+      if (title.length > 2 && title.length < 120 && !isJunkService(title)) items.add(title);
     });
 
     // Strategy 3: service/item title classes — handles grid layouts where individual
@@ -366,7 +478,7 @@ function extractServicesFromHtml(pages: CrawledPage[]): Set<string> {
     if (items.size === 0) {
       $('[class*="item-title"],[class*="service-title"],[class*="card-title"],[class*="tile-title"]').each((_i, el) => {
         const t = normalizeTitle($(el).text());
-        if (t.length > 2 && t.length < 120 && !SERVICE_CONTEXT_RE.test(t.toLowerCase())) items.add(t);
+        if (t.length > 2 && t.length < 120 && !SERVICE_CONTEXT_RE.test(t.toLowerCase()) && !isJunkService(t)) items.add(t);
       });
     }
   }
@@ -398,6 +510,7 @@ function extractServicesFromText(pages: CrawledPage[]): string[] {
       if (/^\d+$/.test(line)) continue;
       // Skip lines that look like nav links or generic words
       if (/^(?:home|contact|about|company|team|people|staff|blog|login|sign\s*in|read\s*more|learn\s*more|get\s*started|careers?|portfolio)$/i.test(line)) continue;
+      if (isJunkService(line)) continue;
 
       items.push(line);
       if (items.length >= 15) break;
@@ -447,84 +560,316 @@ function extractLinkedIn($el: any, $: cheerio.CheerioAPI): string | undefined {
   return url;
 }
 
-function extractTeam(pages: CrawledPage[]): TeamMember[] {
-  const members: TeamMember[] = [];
-  const seen = new Set<string>();
+// ── Team: role-label dictionaries & helpers ───────────────────────────────────
+
+const ROLE_LABELS_EN = [
+  'ceo', 'cfo', 'cto', 'coo', 'cso', 'cmo', 'cpo',
+  'managing director', 'executive director', 'financial director', 'director',
+  'general manager', 'sales manager', 'project manager', 'office manager',
+  'account manager', 'marketing manager', 'operations manager', 'manager',
+  'vice president', 'president', 'chairman', 'vp',
+  'head of sales', 'head of marketing', 'head of finance', 'head of operations',
+  'managing partner', 'partner',
+  'sales representative', 'representative', 'contact person', 'contact',
+  'accountant', 'bookkeeper', 'administrator',
+  'owner', 'co-owner', 'co owner', 'founder', 'co-founder', 'co founder',
+];
+
+const ROLE_LABELS_BG = [
+  'изпълнителен директор', 'търговски директор', 'финансов директор',
+  'административен директор', 'оперативен директор',
+  'управител', 'съуправител',
+  'собственик', 'съсобственик', 'съдружник',
+  'директор',
+  'мениджър продажби', 'офис мениджър', 'проектен мениджър', 'мениджър',
+  'главен счетоводител', 'счетоводител', 'финансист',
+  'търговски представител', 'представител',
+  'лице за контакт', 'за контакт',
+  'изпълнителен партньор', 'партньор',
+];
+
+// Sorted longest-first so multi-word roles are matched before their substrings.
+const ALL_ROLE_LABELS = [...new Set([...ROLE_LABELS_EN, ...ROLE_LABELS_BG])]
+  .sort((a, b) => b.length - a.length);
+const ROLE_LABEL_SET = new Set(ALL_ROLE_LABELS);
+
+// ── Site-language helpers (used by team quality gate) ─────────────────────────
+
+type Script = 'cyrillic' | 'latin' | 'mixed';
+
+// Returns 'cyrillic' when >50 % of script chars across all pages are Cyrillic.
+// Used to detect language mismatch: English demo names on a Bulgarian site.
+function siteScript(pages: CrawledPage[]): Script {
+  let cyr = 0, lat = 0;
+  for (const p of pages) {
+    cyr += (p.text.match(/[Ѐ-ӿ]/g) ?? []).length;
+    lat += (p.text.match(/[a-zA-Z]/g) ?? []).length;
+  }
+  const tot = cyr + lat;
+  if (tot < 200) return 'mixed';
+  const frac = cyr / tot;
+  return frac > 0.50 ? 'cyrillic' : frac < 0.25 ? 'latin' : 'mixed';
+}
+
+function nameScript(name: string): Script {
+  const cyr = (name.match(/[Ѐ-ӿ]/g) ?? []).length;
+  const lat = (name.match(/[a-zA-Z]/g) ?? []).length;
+  if (cyr > 0 && lat === 0) return 'cyrillic';
+  if (lat > 0 && cyr === 0) return 'latin';
+  return 'mixed';
+}
+
+function pageDomain(pages: CrawledPage[]): string {
+  try { return new URL(pages[0].url).hostname.replace(/^www\./, ''); }
+  catch { return ''; }
+}
+
+// Returns true when email belongs to the company's own domain (or a subdomain).
+function isCompanyDomainEmail(email: string, domain: string): boolean {
+  if (!domain || !email) return false;
+  const low = email.toLowerCase();
+  return low.endsWith('@' + domain) || low.endsWith('.' + domain);
+}
+
+function escapeRegex(s: string): string {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+// Returns the original string if it is a known role label, null otherwise.
+function matchRoleLabel(s: string): string | null {
+  const low = s.toLowerCase().trim().replace(/\s+/g, ' ').replace(/[-_]+/g, ' ');
+  return ROLE_LABEL_SET.has(low) ? s.trim() : null;
+}
+
+// Matches "FirstName LastName" or "Иван Иванов": every word starts with one
+// uppercase Unicode letter followed by 1+ lowercase letters; requires ≥2 words.
+const PERSON_NAME_RE = /^[\p{Lu}][\p{Ll}]{1,}(?:[\s\-][\p{Lu}][\p{Ll}]{1,})+$/u;
+
+// Contact-form placeholder text that satisfies PERSON_NAME_RE structurally but
+// is never a real person (e.g. the default value of an HTML <input name="name">).
+const PERSON_PLACEHOLDER_SET = new Set([
+  'first name', 'last name', 'full name', 'your name',
+  'firstname', 'lastname', 'fullname',
+  'name surname', 'name lastname', 'your full name',
+]);
+
+function isPersonName(s: string): boolean {
+  const t = s.trim();
+  if (!PERSON_NAME_RE.test(t)) return false;
+  if (matchRoleLabel(t)) return false;
+  if (PERSON_PLACEHOLDER_SET.has(t.toLowerCase())) return false;
+  return true;
+}
+
+// ── Strategy 4: role-label text-pattern extraction ────────────────────────────
+// Handles lines like:
+//   "Управител: Иван Иванов"   (ROLE: NAME)
+//   "Иван Иванов - управител"  (NAME - ROLE)
+//   "CEO - John Smith"         (ROLE - NAME)
+
+function extractTextPatternMembers(pages: CrawledPage[], seen: Set<string>): TeamMember[] {
+  const found: TeamMember[] = [];
+
+  for (const page of pages) {
+    const lines = page.text.split('\n').map((l) => l.trim()).filter((l) => l.length >= 5 && l.length <= 150);
+
+    for (const line of lines) {
+      // Pattern A: "ROLE: NAME"
+      const colonIdx = line.indexOf(':');
+      if (colonIdx > 1 && colonIdx < line.length - 2) {
+        const left  = line.slice(0, colonIdx).trim();
+        const right = line.slice(colonIdx + 1).trim();
+        const role  = matchRoleLabel(left);
+        if (role && isPersonName(right)) {
+          const key = right.toLowerCase();
+          if (!seen.has(key)) { seen.add(key); found.push({ name: right, position: role }); }
+          continue;
+        }
+      }
+
+      // Pattern B: "NAME — ROLE" or "ROLE — NAME" (dash / en-dash / em-dash)
+      const dashMatch = line.match(/^(.+?)\s*[-–—]\s*(.+)$/);
+      if (dashMatch) {
+        const [, p1, p2] = dashMatch;
+        const role1 = matchRoleLabel(p1);
+        const role2 = matchRoleLabel(p2);
+        if (role2 && isPersonName(p1.trim())) {
+          const key = p1.trim().toLowerCase();
+          if (!seen.has(key)) { seen.add(key); found.push({ name: p1.trim(), position: p2.trim() }); }
+        } else if (role1 && isPersonName(p2.trim())) {
+          const key = p2.trim().toLowerCase();
+          if (!seen.has(key)) { seen.add(key); found.push({ name: p2.trim(), position: p1.trim() }); }
+        }
+      }
+    }
+  }
+
+  return found;
+}
+
+// ── Strategy 5: mailto-proximity extraction ────────────────────────────────────
+// Finds <a href="mailto:…"> links and looks for a role label in the surrounding
+// DOM context.  Also attempts to extract a person name from the same context.
+
+function extractMailtoMembers(pages: CrawledPage[], seen: Set<string>): TeamMember[] {
+  const found: TeamMember[] = [];
 
   for (const page of pages) {
     if (!page.html) continue;
     const $ = cheerio.load(page.html);
 
-    // Strategy 1: try known card selectors
+    $('a[href^="mailto:"]').each((_i, el) => {
+      const href  = $(el).attr('href') ?? '';
+      const email = href.replace(/^mailto:/i, '').split('?')[0].trim().toLowerCase();
+      if (!email || !EMAIL_RE_LOCAL.test(email)) return;
+      if (seen.has(email)) return;
+
+      // Gather text from the nearest meaningful ancestor block element.
+      const $ctx = $(el).closest('div, li, td, p, section, article').first();
+      const contextText = ($ctx.length ? $ctx : $(el).parent()).text().replace(/\s+/g, ' ').trim();
+
+      // Require a role label in the context; otherwise too many false positives.
+      let foundRole: string | null = null;
+      for (const roleLabel of ALL_ROLE_LABELS) {
+        if (new RegExp(`(?:^|[\\s,.:;(\\-])${escapeRegex(roleLabel)}(?:[\\s,.:;)\\-]|$)`, 'iu').test(contextText)) {
+          foundRole = roleLabel;
+          break;
+        }
+      }
+      if (!foundRole) return;
+
+      // Try to extract a person name: look for any "Firstname Lastname" pattern.
+      let foundName: string | null = null;
+      for (const m of contextText.match(/[\p{Lu}][\p{Ll}]{1,}(?:\s[\p{Lu}][\p{Ll}]{1,})+/gu) ?? []) {
+        if (!matchRoleLabel(m)) { foundName = m; break; }
+      }
+
+      seen.add(email);
+      found.push({
+        name:     foundName ?? undefined,
+        position: foundRole,
+        email,
+      });
+    });
+  }
+
+  return found;
+}
+
+function extractTeam(pages: CrawledPage[]): TeamMember[] {
+  const members: TeamMember[] = [];
+  const seen = new Set<string>();
+
+  // Computed once — used by the language-mismatch quality gate on all strategies.
+  const siteLang = siteScript(pages);
+  const domain   = pageDomain(pages);
+
+  // Returns true when this section should be rejected:
+  // Cyrillic-dominant site + every extracted name is Latin + no company-domain email.
+  // This catches Elementor / Avada / WPBakery demo "Our Team" widgets that ship
+  // with placeholder English names (John Portman, Kelley Miles, Sherman Warner, …)
+  // on Bulgarian-language websites.
+  function sectionIsDemo(
+    candidates: Array<{ member: TeamMember; sc: Script }>,
+  ): boolean {
+    if (siteLang !== 'cyrillic') return false;
+    const allLatin = candidates.every((c) => c.sc === 'latin');
+    if (!allLatin) return false;
+    const hasCompanyEmail = candidates.some(
+      (c) => !!c.member.email && isCompanyDomainEmail(c.member.email, domain),
+    );
+    return !hasCompanyEmail;
+  }
+
+  for (const page of pages) {
+    if (!page.html) continue;
+    const $ = cheerio.load(page.html);
+
+    // Strategy 1: try known card selectors ─────────────────────────────────────
     for (const sel of TEAM_CARD_SELECTORS) {
       const cards = $(sel);
       if (cards.length === 0) continue;
 
+      const candidates: Array<{ member: TeamMember; sc: Script }> = [];
+
       cards.each((_i, card) => {
         const $card = $(card);
-        const name = $card.find(NAME_SELECTORS).first().text().trim().split('\n')[0].trim();
-        if (!name || name.length < 2 || name.length > 80) return;
-        if (seen.has(name.toLowerCase())) return;
+        const rawName = $card.find(NAME_SELECTORS).first().text().trim().split('\n')[0].trim();
+        if (!rawName || rawName.length < 2 || rawName.length > 80) return;
+        if (!isPersonName(rawName)) return; // reject section headings, service names, etc.
+        if (seen.has(rawName.toLowerCase())) return;
 
         const rawRole = $card.find(ROLE_SELECTORS).first().text().trim().split('\n')[0].trim();
-        const position = rawRole && rawRole !== name && rawRole.length < 100 ? rawRole : undefined;
+        const position = rawRole && rawRole !== rawName && rawRole.length < 100 ? rawRole : undefined;
         const emailMatch = $card.text().match(EMAIL_RE_LOCAL);
         const linkedin = extractLinkedIn($card, $);
 
-        seen.add(name.toLowerCase());
-        members.push({ name, position, email: emailMatch?.[0], linkedin });
+        candidates.push({
+          member: { name: rawName, position, email: emailMatch?.[0], linkedin },
+          sc: nameScript(rawName),
+        });
       });
 
-      if (members.length > 0) break; // found cards, don't try next selector
+      if (candidates.length === 0) continue;
+      if (sectionIsDemo(candidates)) continue; // language mismatch — likely demo content
+
+      for (const { member } of candidates) {
+        const key = member.name!.toLowerCase();
+        if (!seen.has(key)) { seen.add(key); members.push(member); }
+      }
+      break; // found a valid section — stop trying further selectors
     }
 
-    // Strategy 2: section heading "team"/"people"/"meet" → sibling headings = names
+    // Strategy 2: section heading "team/people/екип/ръководство/…" → sibling headings = names
     if (members.length === 0) {
+      const candidates: Array<{ member: TeamMember; sc: Script }> = [];
+
       $('h1, h2, h3').each((_i, el) => {
         const headingText = $(el).text().toLowerCase();
-        if (!/(?:our\s+)?(?:team|people|staff)|meet\s+(?:our|the)/.test(headingText)) return;
+        if (!/(?:our\s+)?(?:team|people|staff)|meet\s+(?:our|the)|екип|ръководство|управлени[ея]|нашият?\s+екип/.test(headingText)) return;
 
         $(el).closest('section, div').find('h3, h4').each((_j, nameEl) => {
           if (nameEl === el) return;
           const name = $(nameEl).text().trim().split('\n')[0].trim();
           if (!name || name.length < 2 || name.length > 80) return;
+          if (!isPersonName(name)) return;
           if (seen.has(name.toLowerCase())) return;
 
           const rawRole = $(nameEl).next(ROLE_SELECTORS).first().text().trim().split('\n')[0].trim();
           const position = rawRole && rawRole.length < 100 ? rawRole : undefined;
-
-          seen.add(name.toLowerCase());
-          members.push({ name, position });
+          candidates.push({ member: { name, position }, sc: nameScript(name) });
         });
       });
+
+      if (candidates.length > 0 && !sectionIsDemo(candidates)) {
+        for (const { member } of candidates) {
+          const key = member.name!.toLowerCase();
+          if (!seen.has(key)) { seen.add(key); members.push(member); }
+        }
+      }
     }
 
     // Strategy 3: page-builder layouts (WPBakery, Elementor, Divi) where names are
     // rendered as bold <p> elements rather than headings.  Only activates when a
     // "meet / team / management" section heading is present on the page.
     if (members.length === 0) {
-      // Require at least one team-section heading on this page before scanning
       const hasTeamSection = $('h1, h2, h3').toArray().some(
-        (el) => /(?:meet|team|management|staff|people)/i.test($(el).text()),
+        (el) => /(?:meet|team|management|staff|people)|екип|ръководство|управлени[ея]/i.test($(el).text()),
       );
-      if (!hasTeamSection) continue; // skip to next page
+      if (!hasTeamSection) continue;
 
-      // Person names are rendered as bold <p> with inline font-weight style.
-      // Validate the text looks like a real name (2+ capitalised words, no digits).
       // eslint-disable-next-line no-misleading-character-class
       const FULL_NAME_RE = /^[\p{Lu}][\p{Ll}]+(?:\s[\p{Lu}][\p{Ll}]+)+$/u;
+      const candidates: Array<{ member: TeamMember; sc: Script }> = [];
 
       $('p[style]').each((_i, el) => {
         const style = $(el).attr('style') ?? '';
         if (!/font-weight\s*:\s*(?:bold|[6-9]\d\d)/i.test(style)) return;
 
         const text = $(el).text().trim().replace(/\s+/g, ' ');
-        if (!FULL_NAME_RE.test(text)) return; // must look like "First Last"
+        if (!FULL_NAME_RE.test(text)) return;
         if (seen.has(text.toLowerCase())) return;
 
-        seen.add(text.toLowerCase());
-
-        // Position: next sibling <p> (the role paragraph in WPBakery)
         const $next = $(el).next('p');
         const rawRole = $next.text().trim().split('\n')[0].trim().replace(/\s+/g, ' ');
         const position =
@@ -533,11 +878,26 @@ function extractTeam(pages: CrawledPage[]): TeamMember[] {
             : undefined;
 
         const emailMatch = $(el).closest('div').text().match(EMAIL_RE_LOCAL);
-
-        members.push({ name: text, position, email: emailMatch?.[0] });
+        candidates.push({
+          member: { name: text, position, email: emailMatch?.[0] },
+          sc: nameScript(text),
+        });
       });
+
+      if (candidates.length > 0 && !sectionIsDemo(candidates)) {
+        for (const { member } of candidates) {
+          const key = member.name!.toLowerCase();
+          if (!seen.has(key)) { seen.add(key); members.push(member); }
+        }
+      }
     }
   }
+
+  // Strategy 4: text-pattern extraction — evidence-based (always has role label).
+  for (const m of extractTextPatternMembers(pages, seen)) members.push(m);
+
+  // Strategy 5: mailto-proximity — evidence-based (requires role label near mailto).
+  for (const m of extractMailtoMembers(pages, seen)) members.push(m);
 
   return members.slice(0, 50);
 }
@@ -594,7 +954,23 @@ function computeCompletionScore(profile: Omit<ExtractedProfile, 'completionScore
 
 export function extractProfile(pages: CrawledPage[]): ExtractedProfile {
   const allEmails = [...new Set(pages.flatMap((p) => p.emails))];
-  const allPhones = [...new Set(pages.flatMap((p) => p.phones))];
+  // Dedup phones across pages by canonical form so formatting variants and
+  // local/international representations of the same number are stored only once.
+  // "0893 / 35 41 42" and "0893/35 41 42" → same; "0875 300 000" and
+  // "+359 875 300 000" → same canonical "+359875300000", international form wins.
+  const phoneMap = new Map<string, string>();
+  for (const page of pages) {
+    for (const phone of page.phones) {
+      const norm = normalizePhone(phone);
+      const canonical = canonicalizePhone(norm);
+      if (!phoneMap.has(canonical)) {
+        phoneMap.set(canonical, phone);
+      } else if (norm.startsWith('+') && !normalizePhone(phoneMap.get(canonical)!).startsWith('+')) {
+        phoneMap.set(canonical, phone);
+      }
+    }
+  }
+  const allPhones = [...phoneMap.values()];
 
   const base = {
     name:        extractCompanyName(pages),
