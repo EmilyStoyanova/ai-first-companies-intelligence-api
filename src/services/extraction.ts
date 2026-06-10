@@ -6,6 +6,7 @@ export interface TeamMember {
   name?: string;
   position?: string;
   email?: string;
+  phone?: string;
   linkedin?: string;
 }
 
@@ -180,9 +181,45 @@ const GENERIC_AUTH_NAME_SET = new Set([
   'начало',             // "Home" / "Start"
   'добре дошли',        // "Welcome"
   'добре дошли!',
-  // Language-switcher button text extracted as site name
-  'english version', 'bg version', 'en version', 'bg', 'en',
+  // Standalone language names used as button/link text on multilingual sites.
+  // Covers cases like <a href="/en">English</a> or <img alt="Deutsch">.
+  'english', 'bulgarian', 'german', 'french', 'spanish', 'italian',
+  'russian', 'dutch', 'portuguese', 'romanian', 'greek', 'turkish',
+  'polish', 'czech', 'swedish', 'norwegian', 'danish', 'finnish',
+  'hungarian', 'slovak', 'ukrainian', 'serbian', 'croatian',
+  'slovenian', 'macedonian',
+  // Languages written in their own script — common on Bulgarian sites
+  'deutsch', 'français', 'español', 'italiano', 'português', 'română',
+  // ISO 639-1 two-letter codes used as nav labels
+  'bg', 'en', 'de', 'fr', 'es', 'it', 'ru', 'nl', 'pt', 'ro',
+  'el', 'tr', 'pl', 'cs', 'sv', 'no', 'da', 'fi', 'hu', 'sk',
+  'uk', 'sr', 'hr', 'sl', 'mk',
 ]);
+
+// Catches language-switcher labels that follow a "[language] version" or
+// "switch/select language" pattern — more comprehensive than a fixed word list
+// because new language codes can be added by any CMS at any time.
+//
+// Root cause reference: alts like "English version", "bg version", "de version"
+// were extracted via the broad `header a img:first-child` selector in
+// extractLogoAlt when the language-switch <a><img> appeared before the real
+// logo link in the header DOM.
+const LANG_SWITCH_RE = new RegExp(
+  '^(?:' +
+  // "[2- or 3-letter code] version/language/site/page" — en version, de version, bg version, …
+  '[a-z]{2,3}\\s+(?:version|language|lang|site|page)|' +
+  // "[full language name] version" — english version, bulgarian version, german version, …
+  '(?:english|bulgarian|german|french|spanish|italian|russian|dutch|czech|polish|' +
+  'romanian|greek|turkish|portuguese|hungarian|ukrainian|serbian|croatian|slovenian|' +
+  'macedonian|swedish|norwegian|danish|finnish|slovak|deutsch|fran[çc]ais|espa[nñ]ol|' +
+  'italiano|portugu[eê]s|rom[aâ]n[aă])\\s+version|' +
+  // "switch/select/change/choose language" — UI action labels
+  '(?:switch|select|change|choose|pick)\\s+(?:language|lang(?:uage)?)|' +
+  // "language switch/switcher/selector/picker/toggle/menu" — reverse word order
+  'language\\s+(?:switch(?:er)?|select(?:or|ion)?|picker|toggle|menu|options?)' +
+  ')$',
+  'i',
+);
 
 // Returns true when the string is a generic auth/page label that can never
 // be a real company name.  Safe to call with null/undefined.
@@ -193,7 +230,7 @@ export function isGenericAuthName(name?: string | null): boolean {
     .trim()
     .replace(/[-_]+/g, ' ')
     .replace(/\s+/g, ' ');
-  return GENERIC_AUTH_NAME_SET.has(normalised);
+  return GENERIC_AUTH_NAME_SET.has(normalised) || LANG_SWITCH_RE.test(normalised);
 }
 
 // Extracts a company-name candidate from the first plausible logo <img> alt text.
@@ -264,11 +301,13 @@ function extractCompanyName(pages: CrawledPage[]): string | undefined {
   const ogSite = $('meta[property="og:site_name"]').attr('content')?.trim();
   if (ogSite && !BLOCKED_TITLE_RE.test(ogSite) && !isGenericAuthName(ogSite)) return ogSite;
 
-  // Priority 2: <title> first segment (text before | or -)
+  // Priority 2: <title> — try each pipe/dash-separated segment in order so that
+  // "Вход | ХУБЕВ" correctly yields "ХУБЕВ" rather than stopping at "Вход".
   const title = $('title').text().trim();
   if (title) {
-    const candidate = title.split(/[|\-–]/)[0].trim();
-    if (!BLOCKED_TITLE_RE.test(candidate) && !isGenericAuthName(candidate)) return candidate;
+    for (const seg of title.split(/[|\-–]/).map((s) => s.trim()).filter(Boolean)) {
+      if (!BLOCKED_TITLE_RE.test(seg) && !isGenericAuthName(seg)) return seg;
+    }
   }
 
   // Priority 3: logo alt text — sites that set title to a generic value often
@@ -330,13 +369,63 @@ function looksLikeServerBanner(text: string): boolean {
   return /^apache\b|^nginx\b|^microsoft-iis\b|server at .+ port \d+/i.test(text);
 }
 
+// Returns true when the text is a timeline / history entry rather than a postal address.
+//
+// Key signals:
+//   - Year (1900–2099) directly concatenated with a letter and no separating space:
+//     "2008Construction", "2010Expansion" — arises when bad HTML omits whitespace
+//     between a year heading and the following text node.
+//   - Two or more year markers (19xx / 20xx) in a line longer than 60 chars:
+//     milestone lists like "2008 first factory | 2012 second warehouse".
+//
+// Does NOT fire on postal codes (e.g. "1784 Sofia") because those are 4-digit
+// numbers NOT in the 1900–2099 range or are followed by a space, not a letter.
+export function looksLikeTimeline(text: string): boolean {
+  if (/\b(?:19|20)\d{2}[A-Za-zА-Яа-яЁё]/.test(text)) return true;
+  if (text.length >= 40 && (text.match(/\b(?:19|20)\d{2}\b/g) ?? []).length >= 2) return true;
+  return false;
+}
+
+// Strips map-widget UI artefacts from an address candidate.
+//
+// Google Maps and similar widgets append labels like "Distance:" to address text
+// when the address container and the map iframe share the same parent DOM element.
+// Pipe separators appear when map widgets emit the same address in multiple formats
+// (e.g. "Street Name | District | City").
+export function cleanAddressArtifacts(raw: string): string {
+  let s = raw
+    // Strip "Адрес:" / "Address:" label prefix — keep only the value
+    .replace(/^\s*(?:Адрес|Address)\s*:\s*/i, '')
+    // Remove "Distance:" and all trailing content (greedy — also removes " | next fragment")
+    .replace(/\s+Distance:.*$/gi, '')
+    // Remove other common map-widget action labels
+    .replace(/\s+(?:Directions?|Get\s+directions?|View\s+(?:on\s+)?map|Open\s+map|Show\s+map)\b.*$/gi, '')
+    // Strip Bulgarian VAT "ИН: 123456789" and everything after it.
+    // Use \s+ (not \b) — Cyrillic chars are not \w so \b doesn't fire on them.
+    .replace(/\s+ИН\s*:\s*\d+.*$/g, '')
+    // Strip trailing navigation labels that appear in search snippets
+    .replace(/\s+(?:Контакти|Contacts?)\b.*$/gi, '')
+    .trim();
+  // If a pipe separator remains, keep only the first (most specific) fragment
+  const pipe = s.indexOf(' | ');
+  if (pipe > 0) s = s.slice(0, pipe).trim();
+  return s.replace(/[,;|.]\s*$/, '').trim();
+}
+
 function extractLocation(pages: CrawledPage[]): string | undefined {
   // 1. Semantic <address> HTML element
   for (const page of pages) {
     if (!page.html) continue;
     const $ = cheerio.load(page.html);
     const text = $('address').first().text().replace(/\s+/g, ' ').trim();
-    if (text.length > 8 && !looksLikeCss(text) && !looksLikeServerBanner(text)) return text;
+    if (
+      text.length > 8 &&
+      !looksLikeCss(text) &&
+      !looksLikeServerBanner(text) &&
+      !looksLikeTimeline(text)
+    ) {
+      return cleanAddressArtifacts(text);
+    }
   }
 
   // 2. Elements with explicit "address" in class (NOT "location" — too broad)
@@ -357,11 +446,15 @@ function extractLocation(pages: CrawledPage[]): string | undefined {
       // Prefer the line that contains a street indicator
       const streetLine = lines.find((l) => STREET_INDICATORS.some((re) => re.test(l)));
       if (streetLine) {
-        found = streetLine.replace(/[,;]\s*$/, '');
+        found = cleanAddressArtifacts(streetLine.replace(/[,;]\s*$/, ''));
       } else if (lines.length > 0) {
-        // Fallback: shortest non-empty line (likely the address, not surrounding headings)
+        // Fallback: shortest non-empty line (likely the address, not surrounding headings).
+        // Reject timeline/history lines — a history section sometimes carries
+        // class="address" by mistake on badly structured sites.
         const shortest = lines.reduce((a, b) => (a.length <= b.length ? a : b));
-        if (shortest.length < 150) found = shortest.replace(/[,;]\s*$/, '');
+        if (shortest.length < 150 && !looksLikeTimeline(shortest)) {
+          found = cleanAddressArtifacts(shortest.replace(/[,;]\s*$/, ''));
+        }
       }
     });
     if (found) return found;
@@ -404,7 +497,7 @@ function extractLocation(pages: CrawledPage[]): string | undefined {
       }
     }
 
-    const cleaned = candidate.replace(/[,;.]\s*$/, '').trim();
+    const cleaned = cleanAddressArtifacts(candidate.replace(/[,;.]\s*$/, '').trim());
     if (cleaned.length < 5) continue;
     const key = cleaned.toLowerCase().replace(/\s/g, '');
     if (seenKeys.has(key)) continue;
@@ -438,6 +531,26 @@ export function isJunkService(s: string): boolean {
   return JUNK_SERVICE_RE.test(s.trim());
 }
 
+// A trailing ':' means the string is a sub-section label ("Additional technologies:").
+// A trailing '?' means it is a rhetorical marketing question ("Защо ние?").
+// Both are structural headings that appear inside service sections but are not
+// themselves concrete service names.
+const HEADING_PUNCTUATION_RE = /[?:]\s*$/;
+
+// Common marketing / "why-choose-us" section titles that appear adjacent to or
+// inside service sections on Bulgarian and English sites.  They describe the
+// company's differentiators, not the services it offers.
+const MARKETING_HEADING_RE =
+  /^(?:защо\s+(?:ние|нас|ни|да\s+(?:ни\s+)?изберете)|защо\s+ни\s+изберете|почему\s+(?:мы|нас)|why\s+(?:us|choose(?:\s+us)?|we|pick(?:\s+us)?)|предимства|нашите?\s+предимства|предности|нашите?\s+предности|advantages?|benefits?|our\s+(?:advantages?|benefits?|strengths?|features?)|strengths?|highlights?)$/i;
+
+// Returns true when the string is a section heading or marketing label that can
+// never be a concrete service name, even though it might appear inside a services
+// section of the page.
+export function isSectionHeadingNoise(s: string): boolean {
+  const t = s.trim();
+  return HEADING_PUNCTUATION_RE.test(t) || MARKETING_HEADING_RE.test(t);
+}
+
 function extractServicesFromHtml(pages: CrawledPage[]): Set<string> {
   const items = new Set<string>();
 
@@ -453,14 +566,14 @@ function extractServicesFromHtml(pages: CrawledPage[]): Set<string> {
       // Adjacent <ul>/<ol>
       $(el).nextAll('ul, ol').first().find('li').each((_j, li) => {
         const t = normalizeTitle($(li).clone().children('ul, ol').remove().end().text());
-        if (t.length > 2 && t.length < 120 && !isJunkService(t)) items.add(t);
+        if (t.length > 2 && t.length < 120 && !isJunkService(t) && !isSectionHeadingNoise(t)) items.add(t);
       });
 
       // Cards/headings inside the nearest section/div container
       $(el).closest('section, div[class]').find('h3, h4, [class*="card"] h3, [class*="service"] h4, [class*="item"] h4').each((_j, card) => {
         if (card === el) return;
         const t = normalizeTitle($(card).text());
-        if (t.length > 2 && t.length < 120 && !SERVICE_CONTEXT_RE.test(t.toLowerCase()) && !isJunkService(t)) items.add(t);
+        if (t.length > 2 && t.length < 120 && !SERVICE_CONTEXT_RE.test(t.toLowerCase()) && !isJunkService(t) && !isSectionHeadingNoise(t)) items.add(t);
       });
     });
 
@@ -469,7 +582,7 @@ function extractServicesFromHtml(pages: CrawledPage[]): Set<string> {
       // Skip the outer wrapper (it would grab the section heading)
       if ($(el).find('[class*="service"],[class*="card"],[class*="item"]').length > 2) return;
       const title = normalizeTitle($(el).find('h2, h3, h4, strong').first().text());
-      if (title.length > 2 && title.length < 120 && !isJunkService(title)) items.add(title);
+      if (title.length > 2 && title.length < 120 && !SERVICE_CONTEXT_RE.test(title.toLowerCase()) && !isJunkService(title) && !isSectionHeadingNoise(title)) items.add(title);
     });
 
     // Strategy 3: service/item title classes — handles grid layouts where individual
@@ -478,7 +591,7 @@ function extractServicesFromHtml(pages: CrawledPage[]): Set<string> {
     if (items.size === 0) {
       $('[class*="item-title"],[class*="service-title"],[class*="card-title"],[class*="tile-title"]').each((_i, el) => {
         const t = normalizeTitle($(el).text());
-        if (t.length > 2 && t.length < 120 && !SERVICE_CONTEXT_RE.test(t.toLowerCase()) && !isJunkService(t)) items.add(t);
+        if (t.length > 2 && t.length < 120 && !SERVICE_CONTEXT_RE.test(t.toLowerCase()) && !isJunkService(t) && !isSectionHeadingNoise(t)) items.add(t);
       });
     }
   }
@@ -511,6 +624,7 @@ function extractServicesFromText(pages: CrawledPage[]): string[] {
       // Skip lines that look like nav links or generic words
       if (/^(?:home|contact|about|company|team|people|staff|blog|login|sign\s*in|read\s*more|learn\s*more|get\s*started|careers?|portfolio)$/i.test(line)) continue;
       if (isJunkService(line)) continue;
+      if (isSectionHeadingNoise(line)) continue;
 
       items.push(line);
       if (items.length >= 15) break;
@@ -593,6 +707,26 @@ const ALL_ROLE_LABELS = [...new Set([...ROLE_LABELS_EN, ...ROLE_LABELS_BG])]
   .sort((a, b) => b.length - a.length);
 const ROLE_LABEL_SET = new Set(ALL_ROLE_LABELS);
 
+// ── Team: personal-email inference ────────────────────────────────────────────
+
+// Email local-part strings that identify department/role mailboxes, never a person.
+export const GENERIC_EMAIL_LOCALS = new Set([
+  'info', 'office', 'sales', 'accounting', 'accounts', 'accountant',
+  'manager', 'marketing', 'factory', 'orders', 'order',
+  'admin', 'administrator', 'webmaster', 'support', 'helpdesk', 'help',
+  'contact', 'contacts', 'noreply', 'no-reply', 'donotreply',
+  'finance', 'hr', 'humanresources', 'careers', 'jobs', 'recruitment',
+  'team', 'enquiry', 'enquiries', 'inquiry', 'inquiries',
+  'service', 'services', 'billing', 'invoices', 'invoice',
+  'press', 'media', 'pr', 'legal', 'compliance',
+  'hello', 'hi', 'reception', 'mail', 'post', 'shop',
+  'export', 'import', 'logistics', 'delivery', 'warehouse', 'production',
+  'quality', 'technical', 'tech', 'it', 'itsupport',
+  'web', 'website', 'webinfo',
+  'ceo', 'cfo', 'cto', 'coo', 'director',
+  'general', 'commercial', 'trade', 'purchasing',
+]);
+
 // ── Site-language helpers (used by team quality gate) ─────────────────────────
 
 type Script = 'cyrillic' | 'latin' | 'mixed';
@@ -653,12 +787,87 @@ const PERSON_PLACEHOLDER_SET = new Set([
   'name surname', 'name lastname', 'your full name',
 ]);
 
-function isPersonName(s: string): boolean {
+// Broader pattern for two-word contact-form field labels not covered by the set.
+// Examples: "Your Message", "Company Name", "Phone Number", "Enter Name".
+// Anchored so "Enter the Name" or "First Named Employee" are not rejected.
+const FORM_LABEL_RE =
+  /^(?:first|last|full|middle|your|enter|contact|company|phone|mobile|email|subject|message|business)\s+(?:name|surname|email|address|message|subject|number|here|info(?:rmation)?|field)$/i;
+
+// Word-level guard: rejects any string that contains one of these form-field
+// keywords as a standalone word.  Catches greedy multi-word matches produced by
+// the Strategy 5 context regex (e.g. "Иван Иванов First Name Управitel" where
+// the capitalized run spans a real name and a form label in the same text block).
+const FORM_KEYWORD_RE =
+  /(?:^|\s)(?:first|last|full|your|enter|company|phone|mobile|email|subject|message|business)(?:\s|$)/i;
+
+export function isPersonName(s: string): boolean {
   const t = s.trim();
   if (!PERSON_NAME_RE.test(t)) return false;
   if (matchRoleLabel(t)) return false;
   if (PERSON_PLACEHOLDER_SET.has(t.toLowerCase())) return false;
+  if (FORM_LABEL_RE.test(t)) return false;
+  if (FORM_KEYWORD_RE.test(t)) return false;
   return true;
+}
+
+// Returns true when the local part looks like "initial + surname" concatenated
+// (e.g. "vtashev" = V. Tashev) rather than a standalone first name ("toni", "nina").
+// Only called for single-word locals without dots or underscores.
+function localIsInitialSurname(local: string): boolean {
+  if (local.length < 5) return false;
+  const VOWELS = 'aeiou';
+  const c0 = local[0].toLowerCase();
+  const c1 = local[1].toLowerCase();
+  // Vowel start → clearly a first name (Anna, Elena, Ivo)
+  if (VOWELS.includes(c0)) return false;
+  // Known consonant clusters that start real first names, not initial prefixes.
+  // Covers Bulgarian transliterations (ts/tz=Ц, zh=Ж, sh=Ш, ch=Ч) and common
+  // Latin-name starts (kr, pr, br, pl, tr, gr, st, etc.).
+  const validClusters = new Set([
+    'ts', 'tz', 'ch', 'sh', 'zh', 'kh', 'ph',
+    'kr', 'pr', 'br', 'pl', 'bl', 'tr', 'gr', 'gl', 'fl', 'fr',
+    'dr', 'sw', 'tw', 'sl', 'sn', 'sm', 'sp', 'st', 'sc', 'sk',
+    'ps', 'kn', 'cl', 'mn',
+  ]);
+  if (validClusters.has(c0 + c1)) return false;
+  // Both first chars are consonants and the pair is not a known cluster → initial+surname
+  return !VOWELS.includes(c1);
+}
+
+// Infer a display name from an email local part.  Returns undefined when name
+// cannot be inferred with reasonable confidence (generic mailbox, initial+surname
+// pattern, or unrecognised structure).
+export function inferNameFromLocal(local: string): string | undefined {
+  const lower = local.toLowerCase().trim();
+  // Strip trailing digit suffix (toni2 → toni, nina3 → nina)
+  const stripped = lower.replace(/\d+$/, '');
+  if (!stripped) return undefined;
+
+  if (GENERIC_EMAIL_LOCALS.has(stripped)) return undefined;
+
+  // Dot-separated: first.last → "First Last"
+  if (stripped.includes('.')) {
+    const parts = stripped.split('.').filter((p) => p.length >= 2 && /^[a-zа-яёіїє]+$/i.test(p));
+    if (parts.length === 2) {
+      return parts.map((p) => p.charAt(0).toUpperCase() + p.slice(1)).join(' ');
+    }
+  }
+
+  // Underscore-separated: first_last → "First Last"
+  if (stripped.includes('_')) {
+    const parts = stripped.split('_').filter((p) => p.length >= 2 && /^[a-zа-яёіїє]+$/i.test(p));
+    if (parts.length === 2) {
+      return parts.map((p) => p.charAt(0).toUpperCase() + p.slice(1)).join(' ');
+    }
+  }
+
+  // Single word (Latin or Cyrillic), 3–20 chars
+  if (/^[a-zа-яёіїє]{3,20}$/i.test(stripped)) {
+    if (localIsInitialSurname(stripped)) return undefined;
+    return stripped.charAt(0).toUpperCase() + stripped.slice(1);
+  }
+
+  return undefined;
 }
 
 // ── Strategy 4: role-label text-pattern extraction ────────────────────────────
@@ -738,10 +947,12 @@ function extractMailtoMembers(pages: CrawledPage[], seen: Set<string>): TeamMemb
       }
       if (!foundRole) return;
 
-      // Try to extract a person name: look for any "Firstname Lastname" pattern.
+      // Try to extract a person name — must pass the full isPersonName quality gate
+      // (not just the role-label check) so that form labels such as "First Name"
+      // or "Your Message" that appear in the mailto context are rejected.
       let foundName: string | null = null;
       for (const m of contextText.match(/[\p{Lu}][\p{Ll}]{1,}(?:\s[\p{Lu}][\p{Ll}]{1,})+/gu) ?? []) {
-        if (!matchRoleLabel(m)) { foundName = m; break; }
+        if (isPersonName(m)) { foundName = m; break; }
       }
 
       seen.add(email);
@@ -899,27 +1110,137 @@ function extractTeam(pages: CrawledPage[]): TeamMember[] {
   // Strategy 5: mailto-proximity — evidence-based (requires role label near mailto).
   for (const m of extractMailtoMembers(pages, seen)) members.push(m);
 
+  // Strategy 6: clicked contacts from Playwright team-card interaction.
+  // These arrive pre-verified (mailto/tel links confirmed by click), so no
+  // further quality filtering is applied — just deduplication.
+  for (const page of pages) {
+    for (const contact of page.clickedContacts ?? []) {
+      // Deduplicate by email → name+phone fallback.
+      const key = contact.email ?? `${contact.name ?? ''}|${contact.phone ?? ''}`;
+      if (!key || seen.has(key)) continue;
+      seen.add(key);
+      members.push({
+        name:     contact.name,
+        position: contact.position,
+        email:    contact.email,
+        phone:    contact.phone,
+      });
+    }
+  }
+
+  // Strategy 7: personal company-domain emails → infer team members.
+  // Activates when personal emails weren't captured by Strategies 4 & 5
+  // (both require a role label nearby).  Only creates entries for non-generic
+  // local parts; email-only entries are created when name cannot be safely inferred.
+  {
+    const allEmails = [...new Set(pages.flatMap((p) => p.emails))];
+    for (const email of allEmails) {
+      const lower = email.toLowerCase();
+      if (seen.has(lower)) continue;
+      if (!isCompanyDomainEmail(lower, domain)) continue;
+
+      const atIdx = lower.indexOf('@');
+      if (atIdx < 1) continue;
+      const local = lower.slice(0, atIdx);
+      const localNorm = local.replace(/\d+$/, '');
+
+      if (GENERIC_EMAIL_LOCALS.has(localNorm)) continue;
+
+      const name = inferNameFromLocal(local);
+      seen.add(lower);
+      members.push({ name, email: lower });
+    }
+  }
+
   return members.slice(0, 50);
 }
 
 // ── History ───────────────────────────────────────────────────────────────────
 
+// Headings that mark mission/vision/values sections — never genuine company history.
+// Anchored so "About Yotov Stone" is NOT rejected but "About Us" / "About" IS.
+const HISTORY_DENY_HEADING_RE =
+  /^(?:(?:our\s+)?mission(?:\s+statement)?|vision|(?:core\s+)?values?|about(?:\s+(?:us|me|the\s+company|our\s+(?:company|team)))?|who\s+we\s+are|what\s+we\s+(?:do|offer|believe)|our\s+team|contact(?:s|us)?|portfolio|(?:our\s+)?(?:services?|products?)|мисия|нашата\s+мисия|визия|ценности|за\s+нас)$/i;
+
+// Headings that suggest genuine founding / timeline content.
+const HISTORY_HEADING_RE =
+  /histor|our\s+story|company\s+story|brand\s+story|founded|founding|established|journey|mileston|timeline|история|историята|нашата\s+история|основаване|началото|since\s+(?:19|20)\d{2}/i;
+
+// One or more of these in the text confirms it is about company founding / history.
+const HISTORY_SIGNAL_RES = [
+  /\b(?:founded|established|incorporated|created|launched|started|began)\b/i,
+  /\bsince\s+(?:19|20)\d{2}\b/i,
+  /\bin\s+(?:19|20)\d{2}\b/i,
+  /основан[аео]/i,
+  /създаден[аео]/i,
+  /(?:19|20)\d{2}\s*(?:г(?:ода)?\.?|год\.?|година)/i,
+  /история(?:та)?/i,
+  /от\s+(?:19|20)\d{2}/i,
+];
+
+// Returns true when `text` looks like genuine company history content rather than
+// a heading, a mission statement, or other non-history paragraph.
+export function looksLikeHistoryText(text: string): boolean {
+  if (text.length < 30) return false;
+  return HISTORY_SIGNAL_RES.some((re) => re.test(text));
+}
+
+// Collects text from sibling nodes that follow `$el`, stopping at the next heading.
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+function collectFollowingText($el: any, maxChars = 600): string {
+  const parts: string[] = [];
+  let node = $el.next();
+  while (node.length && parts.join(' ').length < maxChars) {
+    const tag = ((node.prop('tagName') as string) ?? '').toLowerCase();
+    if (!tag) break;
+    if (/^h[1-6]$/.test(tag)) break;
+    const t = (node.text() as string).replace(/\s+/g, ' ').trim();
+    if (t) parts.push(t);
+    node = node.next();
+  }
+  return parts.join(' ').trim();
+}
+
 function extractHistory(pages: CrawledPage[]): string | undefined {
-  const aboutPage = pages.find((p) => p.url.includes('/about') || p.url.includes('/history'));
-  if (!aboutPage?.html) return undefined;
+  const isAboutUrl = (url: string) =>
+    /\/(?:about|history|story|about-us|за-нас|история)(?:[/?#]|$)/i.test(url);
 
-  const $ = cheerio.load(aboutPage.html);
-  let history = '';
+  // Prioritise about/history/story pages; fall back to all pages for Strategy 1.
+  const sorted = [
+    ...pages.filter((p) => isAboutUrl(p.url)),
+    ...pages.filter((p) => !isAboutUrl(p.url)),
+  ];
 
-  $('h2, h3').each((_i, el) => {
-    const heading = $(el).text().toLowerCase();
-    if (heading.includes('histor') || heading.includes('about') || heading.includes('founded')) {
-      const next = $(el).next('p');
-      if (next.length) history = next.text().trim();
+  for (const page of sorted) {
+    if (!page.html) continue;
+    const $ = cheerio.load(page.html);
+    const onAboutPage = isAboutUrl(page.url);
+
+    // Strategy 1: history-specific heading → following sibling paragraphs.
+    let found: string | undefined;
+    $('h1, h2, h3, h4').each((_i, el) => {
+      if (found) return;
+      const headingLow = $(el).text().trim().toLowerCase();
+      if (HISTORY_DENY_HEADING_RE.test(headingLow)) return;
+      if (!HISTORY_HEADING_RE.test(headingLow)) return;
+      const text = collectFollowingText($(el));
+      if (looksLikeHistoryText(text)) found = text;
+    });
+    if (found) return found;
+
+    // Strategy 2: on about/history pages scan every <p> for history signals.
+    // Not applied to all pages to avoid false positives on product/contact pages.
+    if (onAboutPage) {
+      $('p').each((_i, el) => {
+        if (found) return;
+        const text = $(el).text().replace(/\s+/g, ' ').trim();
+        if (looksLikeHistoryText(text)) found = text;
+      });
+      if (found) return found;
     }
-  });
+  }
 
-  return history || undefined;
+  return undefined;
 }
 
 // ── Completion score ──────────────────────────────────────────────────────────

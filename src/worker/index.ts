@@ -4,6 +4,10 @@ import { prisma } from '../lib/prisma';
 import { crawlCompany, detectBotProtection, BOT_CRAWL_NOTE } from './crawl';
 import { extractProfile, isGenericAuthName } from '../services/extraction';
 import { enrichSocialLinks } from '../services/socialEnrichment';
+import { enrichAddress } from '../services/addressEnrichment';
+import { validateAddress } from '../services/addressValidation';
+import { validateEmails, selectPageForValidation } from '../services/emailValidation';
+import { validateServices, selectServicesPage } from '../services/servicesValidation';
 import { runLoginFallbackEnrichment } from '../services/loginFallbackEnrichment';
 import { discoverSites, SearchProviderError } from '../services/discovery';
 import { checkFreshness } from '../lib/freshness';
@@ -110,21 +114,133 @@ async function processSingleJob(job: PgBoss.JobWithMetadata<CrawlCompanyPayload>
       } catch { /* non-critical — fallback must never break the crawl pipeline */ }
     }
 
+    // 3d. Address validation — enrichAddress gathers search candidates first;
+    // validateAddress uses both the website candidate and search candidates.
+    // enrichAddress result serves as fallback if AI validation fails or finds nothing.
+    let aiFoundAddress = false;
+    let enrichResult: Awaited<ReturnType<typeof enrichAddress>> | undefined;
+    try {
+      enrichResult = await enrichAddress(profile, domain);
+    } catch { /* non-critical */ }
+
+    try {
+      console.log(`[worker:address-validation] ${domain} ANTHROPIC_API_KEY=${!!process.env.ANTHROPIC_API_KEY}`);
+      const addrVal = await validateAddress(
+        profile.name ?? domain,
+        domain,
+        profile.location ?? '',
+        enrichResult?.searchCandidates ?? [],
+      );
+      if (addrVal.primary) {
+        const hadLocation = !!profile.location;
+        profile.location = addrVal.primary.full_address;
+        aiFoundAddress = true;
+        if (!hadLocation) profile.completionScore = Math.min(100, profile.completionScore + 10);
+        console.log(
+          `[worker:address-validation] ${domain} → "${addrVal.primary.full_address}" source=${addrVal.primary.source} (confidence=${addrVal.primary.confidence})`,
+        );
+      }
+      if (addrVal.notes) {
+        console.log(`[worker:address-validation] ${domain} notes="${addrVal.notes}"`);
+      }
+    } catch (e) {
+      console.warn(`[worker:address-validation] ${domain} failed:`, e);
+    }
+
+    // Fallback: use enrichAddress result directly if AI found nothing
+    if (!aiFoundAddress && enrichResult?.location) {
+      const hadLocation = !!profile.location;
+      profile.location = enrichResult.location;
+      if (!hadLocation) profile.completionScore = Math.min(100, profile.completionScore + 10);
+    }
+
+    // 3e. Email validation — AI-assisted filtering/discovery of emails.
+    // Runs against the best available contact page HTML. If validation returns
+    // verified results (confidence ≥ 70) they replace the regex-extracted set;
+    // lower-confidence candidates are logged but not stored.
+    try {
+      console.log(`[worker:email-validation] ${domain} ANTHROPIC_API_KEY=${!!process.env.ANTHROPIC_API_KEY}`);
+      const validationPage = selectPageForValidation(pages);
+      if (validationPage) {
+        const emailResult = await validateEmails(
+          profile.name ?? domain,
+          domain,
+          validationPage.url,
+          validationPage.html,
+        );
+        if (emailResult.unverified.length > 0) {
+          console.log(
+            `[worker:email-validation] ${domain} unverified=${JSON.stringify(emailResult.unverified.map((e) => `${e.email}(${e.confidence})`))}`,
+          );
+        }
+        if (emailResult.verified.length > 0) {
+          profile.emails = emailResult.verified;
+          console.log(`[worker:email-validation] ${domain} verified=${JSON.stringify(emailResult.verified)}`);
+        } else {
+          console.log(`[worker:email-validation] ${domain} no verified emails — keeping regex results`);
+        }
+        if (emailResult.notes) {
+          console.log(`[worker:email-validation] ${domain} notes="${emailResult.notes}"`);
+        }
+      }
+    } catch (e) {
+      console.warn(`[worker:email-validation] ${domain} failed — keeping regex results:`, e);
+    }
+
+    // 3f. Services validation — AI extraction of services, brands, industry, and target customers.
+    // Uses the services/about page when available. On success the profile services list is
+    // replaced; on no_services_found the pre-existing regex-extracted list is preserved as fallback.
+    let aiRepresentedBrands: string[] = [];
+    let aiPrimaryIndustry: string | undefined;
+    let aiTargetCustomers: string | undefined;
+    try {
+      const svcPage = selectServicesPage(pages);
+      if (svcPage) {
+        const svcResult = await validateServices(
+          profile.name ?? domain,
+          domain,
+          svcPage.url,
+          svcPage.html,
+        );
+        if (svcResult.services.length > 0) {
+          profile.services = svcResult.services;
+          console.log(
+            `[worker:services-validation] ${domain} → ${svcResult.services.length} services (confidence=${svcResult.confidence})`,
+          );
+        } else {
+          console.log(`[worker:services-validation] ${domain} no services found — keeping extracted results`);
+        }
+        aiRepresentedBrands = svcResult.represented_brands;
+        aiPrimaryIndustry   = svcResult.primary_industry;
+        aiTargetCustomers   = svcResult.target_customers;
+        if (svcResult.notes) {
+          console.log(`[worker:services-validation] ${domain} notes="${svcResult.notes}"`);
+        }
+      }
+    } catch (e) {
+      console.warn(`[worker:services-validation] ${domain} failed — keeping extracted results:`, e);
+    }
+
     // 4. Upsert CompanyProfile — preserve existing emails/phones if the new crawl found none.
     // A retry crawl that misses the contact page must not overwrite verified contact data.
     const existingProfile = await prisma.companyProfile.findUnique({
       where: { companyId },
-      select: { emails: true, phones: true, name: true },
+      select: { emails: true, phones: true, name: true, companyNameFromLogo: true },
     });
     const existingEmails = Array.isArray(existingProfile?.emails) ? existingProfile.emails as string[] : [];
     const existingPhones = Array.isArray(existingProfile?.phones) ? existingProfile.phones as string[] : [];
-    // Name resolution: new crawl wins; if it found nothing, preserve an existing real name
-    // but explicitly null out a stale generic auth name (Prisma ignores `undefined` on update,
-    // so we must pass `null` to actually clear a "login" / "вход" / "portal" value).
+    // Name resolution: new crawl wins; if it found nothing, fall back in order:
+    //   1. previously OCR-extracted logo name (if existingName is generic or missing)
+    //   2. existing real name from a prior crawl
+    // A stale generic auth name ("login"/"вход"/"portal") is explicitly nulled out so that
+    // Prisma actually clears it rather than preserving it (Prisma ignores `undefined` on update).
     const existingName = existingProfile?.name as string | null | undefined;
+    const existingLogoName = existingProfile?.companyNameFromLogo as string | null | undefined;
     const upsertName = profile.name != null
       ? profile.name
-      : isGenericAuthName(existingName) ? null : (existingName ?? null);
+      : isGenericAuthName(existingName)
+        ? (existingLogoName || null)
+        : (existingName ?? existingLogoName ?? null);
     const upsertEmails = profile.emails.length > 0 ? profile.emails : existingEmails;
     const upsertPhones = profile.phones.length > 0 ? profile.phones : existingPhones;
     // Adjust score if falling back to preserved contact data
@@ -142,6 +258,9 @@ async function processSingleJob(job: PgBoss.JobWithMetadata<CrawlCompanyPayload>
         emails: upsertEmails,
         phones: upsertPhones,
         services: profile.services,
+        representedBrands: aiRepresentedBrands,
+        primaryIndustry:   aiPrimaryIndustry,
+        targetCustomers:   aiTargetCustomers,
         team: profile.team as unknown as import('@prisma/client').Prisma.InputJsonValue,
         history: profile.history,
         socialLinks: profile.socialLinks,
@@ -159,6 +278,9 @@ async function processSingleJob(job: PgBoss.JobWithMetadata<CrawlCompanyPayload>
         emails: upsertEmails,
         phones: upsertPhones,
         services: profile.services,
+        representedBrands: aiRepresentedBrands,
+        primaryIndustry:   aiPrimaryIndustry,
+        targetCustomers:   aiTargetCustomers,
         team: profile.team as unknown as import('@prisma/client').Prisma.InputJsonValue,
         history: profile.history,
         socialLinks: profile.socialLinks,

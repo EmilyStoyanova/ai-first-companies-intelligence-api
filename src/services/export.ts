@@ -18,38 +18,6 @@ function serializeTeam(raw: unknown): string {
     .join('; ');
 }
 
-function serializeTeamLinkedIn(raw: unknown): string {
-  if (!raw) return '';
-  const arr: TeamMember[] = Array.isArray(raw) ? raw as TeamMember[] : [];
-  return arr
-    .map((m) => m.linkedin)
-    .filter((url): url is string => Boolean(url))
-    .join(' | ');
-}
-
-function serializeTeamNames(raw: unknown): string {
-  if (!raw) return '';
-  return (Array.isArray(raw) ? raw as TeamMember[] : [])
-    .map((m) => m.name)
-    .filter((n): n is string => Boolean(n))
-    .join(' | ');
-}
-
-function serializeTeamEmails(raw: unknown): string {
-  if (!raw) return '';
-  return (Array.isArray(raw) ? raw as TeamMember[] : [])
-    .map((m) => m.email)
-    .filter((e): e is string => Boolean(e))
-    .join(' | ');
-}
-
-function serializeTeamRoles(raw: unknown): string {
-  if (!raw) return '';
-  return (Array.isArray(raw) ? raw as TeamMember[] : [])
-    .map((m) => m.position)
-    .filter((r): r is string => Boolean(r))
-    .join(' | ');
-}
 
 interface ExportRow {
   domain: string;
@@ -60,10 +28,6 @@ interface ExportRow {
   phones: string;
   services: string;
   team: string;
-  teamLinkedIn: string;
-  teamMembers: string;
-  teamEmails: string;
-  teamRoles: string;
   facebook: string;
   linkedin: string;
   socialLinks: string;   // other platforms: twitter, instagram, youtube
@@ -71,8 +35,6 @@ interface ExportRow {
   crawlStatus: string;
   crawlNote: string;
   loginProtected: string;
-  logoCompanyName: string;
-  logoConfidence: number;
   emailSubject: string;
   outreachMessage: string;
 }
@@ -87,17 +49,13 @@ async function fetchRows(batchId: string, tenantId: string): Promise<ExportRow[]
 
   return companies.map((c) => ({
     domain: c.domain,
-    name: c.profile?.name ?? c.name ?? '',
+    name: c.profile?.name || c.name || '',
     description: c.profile?.description ?? '',
     location: c.profile?.location ?? '',
     emails: Array.isArray(c.profile?.emails) ? (c.profile.emails as string[]).join(', ') : '',
     phones: Array.isArray(c.profile?.phones) ? (c.profile.phones as string[]).join(', ') : '',
     services: Array.isArray(c.profile?.services) ? (c.profile.services as string[]).join(', ') : '',
     team: serializeTeam(c.profile?.team),
-    teamLinkedIn: serializeTeamLinkedIn(c.profile?.team),
-    teamMembers: serializeTeamNames(c.profile?.team),
-    teamEmails:  serializeTeamEmails(c.profile?.team),
-    teamRoles:   serializeTeamRoles(c.profile?.team),
     facebook:    ((c.profile?.socialLinks ?? {}) as Record<string, string>)['facebook']  ?? '',
     linkedin:    ((c.profile?.socialLinks ?? {}) as Record<string, string>)['linkedin']  ?? '',
     socialLinks: Object.entries((c.profile?.socialLinks ?? {}) as Record<string, string>)
@@ -108,8 +66,6 @@ async function fetchRows(batchId: string, tenantId: string): Promise<ExportRow[]
     crawlStatus: c.crawlStatus,
     crawlNote:   c.crawlNote ?? '',
     loginProtected:  c.profile?.loginProtected  ? 'Yes' : 'No',
-    logoCompanyName: (c.profile as Record<string, unknown> | undefined)?.['companyNameFromLogo'] as string ?? '',
-    logoConfidence:  (c.profile as Record<string, unknown> | undefined)?.['logoNameConfidence']  as number ?? 0,
     emailSubject:    c.personalizedContent?.emailSubject    ?? '',
     outreachMessage: c.personalizedContent?.fullMessage     ?? '',
   }));
@@ -138,10 +94,6 @@ export const ExportService = {
         { header: 'Phones',                key: 'phones',          width: 30 },
         { header: 'Services',              key: 'services',        width: 50 },
         { header: 'Team',                  key: 'team',            width: 60 },
-        { header: 'Team LinkedIn Profiles',key: 'teamLinkedIn',    width: 60 },
-        { header: 'Team Members',          key: 'teamMembers',     width: 50 },
-        { header: 'Team Emails',           key: 'teamEmails',      width: 50 },
-        { header: 'Team Roles',            key: 'teamRoles',       width: 50 },
         { header: 'Facebook',              key: 'facebook',        width: 45 },
         { header: 'LinkedIn',              key: 'linkedin',        width: 45 },
         { header: 'Other Social',          key: 'socialLinks',     width: 50 },
@@ -149,8 +101,6 @@ export const ExportService = {
         { header: 'Crawl Status',          key: 'crawlStatus',     width: 15 },
         { header: 'Crawl Note',            key: 'crawlNote',       width: 60 },
         { header: 'Login Protected',       key: 'loginProtected',  width: 15 },
-        { header: 'Logo Company Name',     key: 'logoCompanyName', width: 30 },
-        { header: 'Logo Confidence',       key: 'logoConfidence',  width: 16 },
         { header: 'Email Subject',         key: 'emailSubject',    width: 50 },
         { header: 'Outreach Message',      key: 'outreachMessage', width: 80 },
       ];
@@ -163,9 +113,9 @@ export const ExportService = {
       // CSV
       const headers = [
         'domain', 'name', 'description', 'location',
-        'emails', 'phones', 'services', 'team', 'teamLinkedIn', 'teamMembers', 'teamEmails', 'teamRoles', 'facebook', 'linkedin', 'socialLinks',
+        'emails', 'phones', 'services', 'team', 'facebook', 'linkedin', 'socialLinks',
         'completionScore', 'crawlStatus', 'crawlNote',
-        'loginProtected', 'logoCompanyName', 'logoConfidence',
+        'loginProtected',
         'emailSubject', 'outreachMessage',
       ];
 

@@ -9,6 +9,9 @@ function resolveUrl(href: string, baseUrl: string): string | null {
   }
 }
 
+// Lazy-load placeholders and blank spacers are never real logos.
+const PLACEHOLDER_URL_RE = /lazyload|placeholder|loading\.gif|blank\.|spacer\.|ph\.png|noimage|no-image/i;
+
 // Returns de-duplicated logo URL candidates sorted by descending priority.
 // Priority 1 = highest confidence (explicit "logo" attribute), 5 = lowest.
 export function extractLogoUrls(html: string, baseUrl: string): string[] {
@@ -20,7 +23,7 @@ export function extractLogoUrls(html: string, baseUrl: string): string[] {
   function add(href: string | undefined, priority: number) {
     if (!href) return;
     const resolved = resolveUrl(href, baseUrl);
-    if (!resolved || seen.has(resolved)) return;
+    if (!resolved || seen.has(resolved) || PLACEHOLDER_URL_RE.test(resolved)) return;
     seen.add(resolved);
     candidates.push({ url: resolved, priority });
   }

@@ -5,6 +5,9 @@ import { mergeEmails } from '../lib/emailExtraction';
 import { extractPhones } from '../lib/phoneExtraction';
 import { detectLoginPage } from '../services/loginDetection';
 import { extractLogoUrls } from '../services/logoExtraction';
+import { ClickedContact, extractClickedContacts, TEAM_CARD_SELECTORS } from '../lib/teamInteraction';
+
+export type { ClickedContact };
 
 export interface CrawledPage {
   url: string;
@@ -14,6 +17,8 @@ export interface CrawledPage {
   phones: string[];
   loginProtected: boolean;
   logoUrls: string[];
+  /** Contacts extracted by clicking team-member cards in Playwright. Undefined on Cheerio pages. */
+  clickedContacts?: ClickedContact[];
 }
 
 // Contact pages get crawl priority so they're never crowded out by nav links.
@@ -368,6 +373,29 @@ async function crawlWithPlaywright(baseUrl: string): Promise<CrawledPage[]> {
         const { loginProtected } = detectLoginPage(html, text);
         const logoUrls = loginProtected ? extractLogoUrls(html, baseUrl) : [];
         console.log(`[crawl:playwright:page] ${request.url} — emails(${emails.length})=${JSON.stringify(emails)}`);
+
+        // Team-card interaction: click cards to reveal contact modals.
+        // Guard: only on team/contact pages that contain a known card selector
+        // in the static HTML — avoids expensive interaction on unrelated pages.
+        let clickedContacts: ClickedContact[] | undefined;
+        if (shouldSaveHtml(request.url)) {
+          const htmlLower = html.toLowerCase();
+          const hasCards = TEAM_CARD_SELECTORS.some((sel) => {
+            // Convert selector to a plain class/attribute keyword for a fast
+            // string pre-check before we do any Playwright DOM queries.
+            const kw = sel.replace(/[.[\]*"^$]/g, '').toLowerCase();
+            return kw.length > 2 && htmlLower.includes(kw);
+          });
+          if (hasCards) {
+            clickedContacts = await extractClickedContacts(page).catch(() => undefined);
+            console.log(
+              `[crawl:interact] ${request.url}` +
+              ` — clickedContacts(${clickedContacts?.length ?? 0})=` +
+              JSON.stringify((clickedContacts ?? []).map((c) => c.email ?? c.name ?? '?')),
+            );
+          }
+        }
+
         pages.push({
           url: request.url,
           text,
@@ -376,6 +404,7 @@ async function crawlWithPlaywright(baseUrl: string): Promise<CrawledPage[]> {
           phones,
           loginProtected,
           logoUrls,
+          clickedContacts,
         });
       },
       failedRequestHandler() { /* silent */ },

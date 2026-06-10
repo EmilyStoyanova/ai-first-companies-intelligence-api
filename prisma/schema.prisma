@@ -104,6 +104,9 @@ model CompanyProfile {
   emails              Json     @default("[]")
   phones              Json     @default("[]")
   services            Json     @default("[]")
+  representedBrands   Json     @default("[]")
+  primaryIndustry     String?
+  targetCustomers     String?
   team                Json     @default("[]")
   history             String?
   socialLinks         Json     @default("{}")

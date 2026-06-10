@@ -295,6 +295,23 @@ export function extractEmailsFromIframeSrcdoc(html: string): string[] {
 
 // ── Combine all strategies ────────────────────────────────────────────────────
 
+// Cloudflare XOR-encodes emails; the first 1-2 hex chars are the key byte.
+// When Cheerio renders the protected anchor's text (no JS), the raw hex leaks
+// into the output, producing a numeric-prefixed duplicate like "28serpio_vr@abv.bg"
+// alongside the correctly decoded "serpio_vr@abv.bg".
+// Drop the prefixed version whenever the clean variant is present in the set.
+function deduplicateCfArtifacts(emails: string[]): string[] {
+  const set = new Set(emails);
+  return emails.filter((e) => {
+    const atIdx = e.indexOf('@');
+    if (atIdx < 0) return true;
+    const local = e.slice(0, atIdx);
+    const stripped = local.replace(/^\d{1,3}/, '');
+    if (stripped === local || stripped.length < 2) return true;
+    return !set.has(stripped + e.slice(atIdx));
+  });
+}
+
 export function mergeEmails(text: string, html: string): string[] {
   // When the caller doesn't supply rendered text (or text extraction failed),
   // derive it from the HTML as a safety net. In normal crawler flows this path
@@ -308,7 +325,7 @@ export function mergeEmails(text: string, html: string): string[] {
     } catch { return ''; }
   })();
 
-  return [...new Set([
+  return deduplicateCfArtifacts([...new Set([
     ...extractEmails(effectiveText),
     ...extractEmailsFromHtml(html),
     ...extractSplitEmails(html),
@@ -317,5 +334,5 @@ export function mergeEmails(text: string, html: string): string[] {
     ...extractEmailsFromAttributes(html),
     ...extractEmailsFromJsConcat(html),
     ...extractEmailsFromIframeSrcdoc(html),
-  ])];
+  ])]);
 }

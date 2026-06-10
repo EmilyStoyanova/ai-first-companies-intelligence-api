@@ -24,6 +24,68 @@ function assert(label: string, actual: boolean, expected: boolean) {
   }
 }
 
+// ── Language-switcher labels — expected: true ────────────────────────────────
+console.log('\nLanguage-switcher labels — expected: true (never a company name)');
+
+// Exact strings already in the set (regression guard)
+assert('english version (exact set entry)',  isGenericAuthName('english version'),   true);
+assert('English version (capitalised)',      isGenericAuthName('English version'),   true);
+assert('ENGLISH VERSION (all caps)',         isGenericAuthName('ENGLISH VERSION'),   true);
+assert('bg version',                         isGenericAuthName('bg version'),         true);
+assert('en version',                         isGenericAuthName('en version'),         true);
+assert('bg',                                 isGenericAuthName('bg'),                 true);
+assert('en',                                 isGenericAuthName('en'),                 true);
+
+// Previously-missing [code] version patterns (caught by LANG_SWITCH_RE)
+assert('de version',                         isGenericAuthName('de version'),         true);
+assert('fr version',                         isGenericAuthName('fr version'),         true);
+assert('ru version',                         isGenericAuthName('ru version'),         true);
+assert('DE VERSION (all caps)',              isGenericAuthName('DE VERSION'),         true);
+
+// Previously-missing [full name] version patterns
+assert('bulgarian version',                  isGenericAuthName('bulgarian version'),  true);
+assert('Bulgarian version (capitalised)',    isGenericAuthName('Bulgarian version'),  true);
+assert('german version',                     isGenericAuthName('german version'),     true);
+assert('french version',                     isGenericAuthName('french version'),     true);
+assert('spanish version',                    isGenericAuthName('spanish version'),    true);
+assert('romanian version',                   isGenericAuthName('romanian version'),   true);
+
+// Action labels — switch/select/change language
+assert('switch language',                    isGenericAuthName('switch language'),    true);
+assert('Switch Language (capitalised)',      isGenericAuthName('Switch Language'),    true);
+assert('SWITCH LANGUAGE (all caps)',         isGenericAuthName('SWITCH LANGUAGE'),   true);
+assert('select language',                    isGenericAuthName('select language'),    true);
+assert('change language',                    isGenericAuthName('change language'),    true);
+assert('choose language',                    isGenericAuthName('choose language'),    true);
+assert('switch lang',                        isGenericAuthName('switch lang'),        true);
+
+// "language switch/switcher/selector/…" (reversed word order)
+assert('language switch',                    isGenericAuthName('language switch'),    true);
+assert('language switcher',                  isGenericAuthName('language switcher'),  true);
+assert('language selector',                  isGenericAuthName('language selector'),  true);
+assert('language picker',                    isGenericAuthName('language picker'),    true);
+assert('language menu',                      isGenericAuthName('language menu'),      true);
+assert('language toggle',                    isGenericAuthName('language toggle'),    true);
+
+// Standalone language names (ISO codes + English names)
+assert('english (standalone)',               isGenericAuthName('english'),            true);
+assert('English (capitalised)',              isGenericAuthName('English'),            true);
+assert('bulgarian (standalone)',             isGenericAuthName('bulgarian'),          true);
+assert('Bulgarian',                          isGenericAuthName('Bulgarian'),          true);
+assert('german',                             isGenericAuthName('german'),             true);
+assert('deutsch',                            isGenericAuthName('deutsch'),            true);
+assert('Deutsch',                            isGenericAuthName('Deutsch'),            true);
+assert('français',                           isGenericAuthName('français'),           true);
+assert('español',                            isGenericAuthName('español'),            true);
+assert('de (ISO code)',                      isGenericAuthName('de'),                 true);
+assert('fr (ISO code)',                      isGenericAuthName('fr'),                 true);
+assert('ru (ISO code)',                      isGenericAuthName('ru'),                 true);
+
+// Normalisation: hyphens collapsed before check
+assert('switch-language (hyphen)',           isGenericAuthName('switch-language'),   true);
+assert('de-version (hyphen)',               isGenericAuthName('de-version'),         true);
+assert('english-version (hyphen)',          isGenericAuthName('english-version'),    true);
+
 // ── Should return TRUE (generic auth names) ───────────────────────────────────
 console.log('\nGeneric auth names — expected: true');
 
@@ -98,6 +160,19 @@ assert('SoftUni',                  isGenericAuthName('SoftUni'),                
 assert('undefined (falsy)',        isGenericAuthName(undefined),                  false);
 assert('null (falsy)',             isGenericAuthName(null),                       false);
 assert('empty string',            isGenericAuthName(''),                         false);
+
+// Names that CONTAIN a language keyword but are not switcher labels
+assert('English & Sons (multi-word, non-version)', isGenericAuthName('English & Sons'),         false);
+assert('Bulgarian Rose Ltd',                       isGenericAuthName('Bulgarian Rose Ltd'),     false);
+assert('German Auto Parts',                        isGenericAuthName('German Auto Parts'),      false);
+assert('English School Sofia',                     isGenericAuthName('English School Sofia'),   false);
+assert('New German Bridge',                        isGenericAuthName('New German Bridge'),      false);
+assert('Switch Networks (not language)',            isGenericAuthName('Switch Networks'),        false);
+assert('Select Solutions (not language)',           isGenericAuthName('Select Solutions'),       false);
+// "version" alone is not a language-switch label
+assert('version alone',                            isGenericAuthName('version'),                false);
+// Chehplast domain name — what the fallback should return
+assert('Chehplast (domain-derived)',               isGenericAuthName('Chehplast'),              false);
 
 // ── extractCompanyName fallback chain (via extractProfile) ────────────────────
 console.log('\nextractCompanyName fallback chain');

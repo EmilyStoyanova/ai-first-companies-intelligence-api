@@ -8,7 +8,7 @@
 export {}; // make this file a module so `passed`/`failed` don't collide with other test files
 
 // eslint-disable-next-line @typescript-eslint/no-require-imports
-const { extractProfile } = require('../extraction') as typeof import('../extraction');
+const { extractProfile, isPersonName } = require('../extraction') as typeof import('../extraction');
 
 let passed = 0;
 let failed = 0;
@@ -347,6 +347,179 @@ assertTeam(
   </body></html>`,
   'Our company. Alice Johnson CEO Robert Davis CFO',
   (t) => t.some((m) => m.name === 'Alice Johnson') && t.some((m) => m.name === 'Robert Davis'),
+);
+
+// ── isPersonName unit tests ───────────────────────────────────────────────────
+// These directly cover the quality gate applied by all five strategies.
+// The function is also the missing link in Strategy 5 (the bug source).
+console.log('\nisPersonName — must return TRUE (real person names)');
+
+function assertPerson(label: string, input: string, expected: boolean) {
+  const got = isPersonName(input);
+  if (got === expected) {
+    console.log(`  ✓  ${label}`);
+    passed++;
+  } else {
+    console.error(`  ✗  ${label}  (got ${got}, want ${expected})`);
+    failed++;
+  }
+}
+
+// Accepted names from the requirements
+assertPerson('Ivan Ivanov',    'Ivan Ivanov',    true);
+assertPerson('John Smith',     'John Smith',     true);
+assertPerson('Maria Petrova',  'Maria Petrova',  true);
+assertPerson('Dimcho Yotov',   'Dimcho Yotov',   true);
+assertPerson('Иван Иванов',    'Иван Иванов',    true);
+assertPerson('Мария Стоянова', 'Мария Стоянова', true);
+assertPerson('Петър Стоянов',  'Петър Стоянов',  true);
+assertPerson('Elena Kovacheva', 'Elena Kovacheva', true);
+
+console.log('\nisPersonName — must return FALSE (form labels / placeholders / roles)');
+
+// From the requirements — form field labels
+assertPerson('First Name',      'First Name',      false);
+assertPerson('Last Name',       'Last Name',       false);
+assertPerson('Your Name',       'Your Name',       false);
+assertPerson('Contact Person',  'Contact Person',  false); // caught by matchRoleLabel
+assertPerson('Full Name',       'Full Name',       false);
+assertPerson('Name Surname',    'Name Surname',    false);
+
+// FORM_LABEL_RE — additional label combinations not in the fixed placeholder set
+assertPerson('Your Message',    'Your Message',    false);
+assertPerson('Company Name',    'Company Name',    false);
+assertPerson('Phone Number',    'Phone Number',    false);
+assertPerson('Enter Name',      'Enter Name',      false);
+assertPerson('Contact Name',    'Contact Name',    false);
+assertPerson('Business Email',  'Business Email',  false);
+assertPerson('Middle Name',     'Middle Name',     false);
+
+// Role labels must not be treated as names
+assertPerson('Managing Director', 'Managing Director', false);
+assertPerson('Sales Manager',     'Sales Manager',     false);
+
+// Single-word strings can never pass PERSON_NAME_RE (requires ≥2 words)
+assertPerson('Message (single word)',  'Message',  false);
+assertPerson('Name (single word)',     'Name',     false);
+assertPerson('Contact (single word)',  'Contact',  false);
+assertPerson('Email (single word)',    'Email',    false);
+
+// ── Contact-form false-positive guard (the reported bug) ─────────────────────
+// Root cause: Strategy 5 used !matchRoleLabel(m) as the name-acceptance check,
+// which passes "First Name" (not a role label) even though it is in
+// PERSON_PLACEHOLDER_SET.  Fix: use isPersonName(m) instead.
+console.log('\nContact-form false positives — must produce NO team members');
+
+// The exact reported bug:
+//   form container has "First Name", "Last Name", "Contact", and a mailto link.
+//   Strategy 5 finds "contact" as a role, "First Name" as the first two-word
+//   capitalised string → previously stored { name: "First Name", position: "contact" }.
+assertTeam(
+  'Strategy 5: "First Name" in form context must NOT become a team member',
+  `<html><body>
+    <div class="contact-section">
+      <label>First Name</label>
+      <label>Last Name</label>
+      <label>Contact</label>
+      <a href="mailto:info@company.bg">info@company.bg</a>
+    </div>
+  </body></html>`,
+  'First Name Last Name Contact info@company.bg',
+  (t) => !t.some((m) => m.name === 'First Name' || m.name === 'Last Name'),
+);
+
+assertTeam(
+  'Strategy 5: "Your Name" in form context must NOT become a team member',
+  `<html><body>
+    <div>
+      <span>Your Name</span>
+      <span>Owner</span>
+      <a href="mailto:contact@firma.bg">contact@firma.bg</a>
+    </div>
+  </body></html>`,
+  'Your Name Owner contact@firma.bg',
+  (t) => !t.some((m) => m.name === 'Your Name'),
+);
+
+assertTeam(
+  'Strategy 5: "Your Message" in form context must NOT become a team member',
+  `<html><body>
+    <div>
+      <label>Your Message</label>
+      <span>Manager</span>
+      <a href="mailto:mgr@company.bg">mgr@company.bg</a>
+    </div>
+  </body></html>`,
+  'Your Message Manager mgr@company.bg',
+  (t) => !t.some((m) => m.name === 'Your Message'),
+);
+
+// Real person name in a clean context (no form labels mixed in) → extracted.
+// In Strategy 5 the context is the text of the nearest block ancestor; when
+// form labels and real names share the same block the greedy regex may merge
+// them.  The clean-context test proves the happy path works correctly.
+assertTeam(
+  'Strategy 5: real name in clean context → name and email extracted',
+  `<html><body>
+    <div>
+      <p>CEO John Smith</p>
+      <a href="mailto:john@company.bg">john@company.bg</a>
+    </div>
+  </body></html>`,
+  'CEO John Smith john@company.bg',
+  (t) => t.some((m) => m.name === 'John Smith' && m.email === 'john@company.bg'),
+);
+
+// Strategy 1 — [class*="name"] selector on a form element: label text must be rejected
+assertTeam(
+  'Strategy 1: [class*="name"] on form label "First Name" inside team card → rejected',
+  `<html><body>
+    <div class="team-card">
+      <span class="name-field">First Name</span>
+      <p class="role">Contact</p>
+    </div>
+  </body></html>`,
+  'First Name Contact',
+  (t) => !t.some((m) => m.name === 'First Name'),
+);
+
+// Text-pattern Strategy 4: "Contact: First Name" must not produce a member
+assertTeam(
+  'Strategy 4: "Contact: First Name" must NOT produce a team member',
+  '<html><body></body></html>',
+  'Contact: First Name',
+  (t) => !t.some((m) => m.name === 'First Name'),
+);
+
+// All of the required real names must still be accepted
+console.log('\nAccepted real names must pass through unaffected');
+
+assertTeam(
+  '"Управител: Ivan Ivanov" → extracted',
+  '<html><body></body></html>',
+  'Управител: Ivan Ivanov',
+  (t) => t.some((m) => m.name === 'Ivan Ivanov'),
+);
+
+assertTeam(
+  '"Owner: Dimcho Yotov" → extracted',
+  '<html><body></body></html>',
+  'Owner: Dimcho Yotov',
+  (t) => t.some((m) => m.name === 'Dimcho Yotov'),
+);
+
+assertTeam(
+  '"CEO: John Smith" → extracted',
+  '<html><body></body></html>',
+  'CEO: John Smith',
+  (t) => t.some((m) => m.name === 'John Smith'),
+);
+
+assertTeam(
+  '"Директор: Maria Petrova" → extracted',
+  '<html><body></body></html>',
+  'Директор: Maria Petrova',
+  (t) => t.some((m) => m.name === 'Maria Petrova'),
 );
 
 // ── Summary ───────────────────────────────────────────────────────────────────

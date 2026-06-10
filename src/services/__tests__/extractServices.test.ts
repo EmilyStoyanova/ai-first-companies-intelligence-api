@@ -13,7 +13,7 @@
  * Run with:  npx ts-node src/services/__tests__/extractServices.test.ts
  */
 
-import { isJunkService, extractProfile } from '../extraction';
+import { isJunkService, isSectionHeadingNoise, extractProfile } from '../extraction';
 
 let passed = 0;
 let failed = 0;
@@ -242,6 +242,133 @@ console.log('\nAll-junk list → empty services array');
     '</body></html>',
   )]);
   assert('All-junk list → services is empty array', profile.services, []);
+}
+
+// ── isSectionHeadingNoise unit tests ─────────────────────────────────────────
+// Root cause reference: "Защо ние ?", "Предимства:", "Additional technologies:",
+// "Special Processes:", "Final Assembly:" were collected as services because
+// extractServicesFromHtml had no guard for trailing punctuation or marketing titles.
+
+console.log('\nisSectionHeadingNoise — must return TRUE (headings / marketing labels)');
+
+// Exact failing examples reported by user
+assert('"Защо ние ?" (trailing ?)',           isSectionHeadingNoise('Защо ние ?'),              true);
+assert('"Предимства:" (trailing :)',           isSectionHeadingNoise('Предимства:'),             true);
+assert('"Additional technologies:" (:)',       isSectionHeadingNoise('Additional technologies:'), true);
+assert('"Special Processes:" (:)',             isSectionHeadingNoise('Special Processes:'),       true);
+assert('"Final Assembly:" (:)',                isSectionHeadingNoise('Final Assembly:'),          true);
+
+// Trailing punctuation patterns
+assert('Trailing : (generic)',                 isSectionHeadingNoise('Category:'),               true);
+assert('Trailing ? (generic)',                 isSectionHeadingNoise('What do we do?'),          true);
+assert('Trailing :  with space',               isSectionHeadingNoise('Category:  '),             true);
+
+// Marketing heading words (no trailing punctuation)
+assert('"Защо ние" (no ?)',                    isSectionHeadingNoise('Защо ние'),                true);
+assert('"Why us" (EN)',                        isSectionHeadingNoise('Why us'),                  true);
+assert('"Why choose us" (EN)',                 isSectionHeadingNoise('Why choose us'),           true);
+assert('"Предимства" (no :)',                  isSectionHeadingNoise('Предимства'),              true);
+assert('"Advantages" (EN)',                    isSectionHeadingNoise('Advantages'),              true);
+assert('"Benefits" (EN)',                      isSectionHeadingNoise('Benefits'),                true);
+assert('"Strengths" (EN)',                     isSectionHeadingNoise('Strengths'),               true);
+assert('"Highlights" (EN)',                    isSectionHeadingNoise('Highlights'),              true);
+assert('"Our advantages" (EN)',                isSectionHeadingNoise('Our advantages'),          true);
+assert('"Our benefits" (EN)',                  isSectionHeadingNoise('Our benefits'),            true);
+
+console.log('\nisSectionHeadingNoise — must return FALSE (real service names)');
+
+assert('"PVC дограма" (service)',              isSectionHeadingNoise('PVC дограма'),             false);
+assert('"Логистика" (service)',                isSectionHeadingNoise('Логистика'),               false);
+assert('"Транспортни услуги" (service)',       isSectionHeadingNoise('Транспортни услуги'),      false);
+assert('"Metal fabrication" (service)',        isSectionHeadingNoise('Metal fabrication'),       false);
+assert('"Injection molding" (service)',        isSectionHeadingNoise('Injection molding'),       false);
+assert('"Software development" (service)',     isSectionHeadingNoise('Software development'),    false);
+// Without the colon, these are valid manufacturing service names
+assert('"Special Processes" (no colon)',       isSectionHeadingNoise('Special Processes'),       false);
+assert('"Final Assembly" (no colon)',          isSectionHeadingNoise('Final Assembly'),          false);
+assert('"Additional technologies" (no colon)', isSectionHeadingNoise('Additional technologies'), false);
+// Short compound names must not be affected
+assert('"Web design" (service)',               isSectionHeadingNoise('Web design'),              false);
+assert('"SEO" (service)',                      isSectionHeadingNoise('SEO'),                     false);
+
+// ── Integration: HTML path rejects section headings and marketing labels ────────
+console.log('\nHTML path — section headings filtered from service lists');
+
+{
+  const profile = extractProfile([makePage(
+    '<html><body>' +
+      '<h2>What we do</h2>' +
+      '<ul>' +
+        '<li>Additional technologies:</li>' +
+        '<li>Special Processes:</li>' +
+        '<li>Final Assembly:</li>' +
+        '<li>Injection molding</li>' +
+        '<li>Metal fabrication</li>' +
+      '</ul>' +
+    '</body></html>',
+  )]);
+  assert(
+    'Section-label headings with ":" filtered; real services kept',
+    [...profile.services].sort(),
+    ['Injection molding', 'Metal fabrication'].sort(),
+  );
+}
+
+{
+  const profile = extractProfile([makePage(
+    '<html><body>' +
+      '<div class="feature-block"><h3>Защо ние ?</h3></div>' +
+      '<div class="feature-block"><h3>Предимства:</h3></div>' +
+      '<div class="feature-block"><h3>PVC дограма</h3></div>' +
+      '<div class="feature-block"><h3>Алуминиева дограма</h3></div>' +
+    '</body></html>',
+  )]);
+  assert(
+    'Marketing headings filtered from feature blocks; real services kept',
+    [...profile.services].sort(),
+    ['Алуминиева дограма', 'PVC дограма'].sort(),
+  );
+}
+
+{
+  // Real-world structure: h2 + sibling h3s inside a wrapping <section> (the
+  // structure Strategy 1's closest('section') is designed for).
+  const profile = extractProfile([makePage(
+    '<html><body>' +
+      '<section class="services">' +
+        '<h2>Our Services</h2>' +
+        '<h3>Additional technologies:</h3>' +
+        '<h3>Special Processes:</h3>' +
+        '<h3>Final Assembly:</h3>' +
+        '<h3>Injection molding</h3>' +
+        '<h3>Metal fabrication</h3>' +
+      '</section>' +
+    '</body></html>',
+  )]);
+  assert(
+    'Sub-section label h3s inside services section filtered; real services kept',
+    [...profile.services].sort(),
+    ['Injection molding', 'Metal fabrication'].sort(),
+  );
+}
+
+console.log('\nText path — section headings filtered');
+
+{
+  const text = [
+    'Services',
+    'Защо ние ?',
+    'Предимства:',
+    'Additional technologies:',
+    'PVC дограма',
+    'Алуминиева дограма',
+  ].join('\n');
+  const profile = extractProfile([makePage('<html><head><title>Company</title></head><body></body></html>', text)]);
+  assert(
+    'Text path: section headings removed, real services kept',
+    [...profile.services].sort(),
+    ['Алуминиева дограма', 'PVC дограма'].sort(),
+  );
 }
 
 // ── Summary ───────────────────────────────────────────────────────────────────
