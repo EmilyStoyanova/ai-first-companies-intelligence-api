@@ -34,6 +34,8 @@ SOURCE PRIORITY RULES:
 3. If both exist and differ — return the website address as primary, \
 include the search address as alternative with a note
 4. Never mix parts from different sources into one address
+5. full_address must contain EXACTLY ONE address — never join multiple addresses \
+with separators like "|", "/", or newlines
 
 VALIDATION RULES — REJECT a candidate if it:
 1. Contains only a city or region without a street (e.g. "Vratsa" alone)
@@ -88,39 +90,42 @@ function buildSystemPrompt(
     .replace('{{searchCandidates}}', candidateStr);
 }
 
-async function callClaudeApi(systemPrompt: string, userContent: string): Promise<string> {
-  const apiKey = process.env.ANTHROPIC_API_KEY;
-  if (!apiKey) throw new Error('ANTHROPIC_API_KEY not set');
+async function callGroqApi(systemPrompt: string, userContent: string): Promise<string> {
+  const apiKey = process.env.GROQ_API_KEY;
+  if (!apiKey) throw new Error('GROQ_API_KEY not set');
 
-  const res = await fetch('https://api.anthropic.com/v1/messages', {
+  const res = await fetch('https://api.groq.com/openai/v1/chat/completions', {
     method: 'POST',
     headers: {
       'content-type': 'application/json',
-      'x-api-key': apiKey,
-      'anthropic-version': '2023-06-01',
+      'authorization': `Bearer ${apiKey}`,
     },
     body: JSON.stringify({
-      model: 'claude-sonnet-4-20250514',
+      model: 'llama-3.3-70b-versatile',
       max_tokens: 1024,
-      system: systemPrompt,
-      messages: [{ role: 'user', content: userContent }],
+      messages: [
+        { role: 'system', content: systemPrompt },
+        { role: 'user', content: userContent },
+      ],
     }),
   });
 
   if (!res.ok) {
     const body = await res.text().catch(() => '');
-    throw new Error(`Claude API responded ${res.status}: ${body.slice(0, 200)}`);
+    throw new Error(`Groq API responded ${res.status}: ${body.slice(0, 200)}`);
   }
 
-  const data = await res.json() as { content: Array<{ type: string; text: string }> };
-  return data.content.find((b) => b.type === 'text')?.text ?? '';
+  const data = await res.json() as { choices: Array<{ message: { content: string } }> };
+  return data.choices[0]?.message?.content ?? '';
 }
 
 function parseValidatedAddress(obj: unknown): ValidatedAddress | undefined {
   if (!obj || typeof obj !== 'object') return undefined;
   const a = obj as Record<string, unknown>;
-  const full_address = typeof a.full_address === 'string' ? a.full_address.trim() : '';
-  if (!full_address) return undefined;
+  const raw_address = typeof a.full_address === 'string' ? a.full_address.trim() : '';
+  if (!raw_address) return undefined;
+  // Take only the first address if the model joined multiple with a separator
+  const full_address = raw_address.split(/\s*\|\s*/)[0].trim();
   const confidence = typeof a.confidence === 'number' ? a.confidence : 0;
   if (confidence < CONFIDENCE_THRESHOLD) return undefined;
   return {
@@ -162,7 +167,7 @@ export async function validateAddress(
   domain: string,
   websiteAddress: string,
   searchCandidates: string[],
-  callFn: CallFn = callClaudeApi,
+  callFn: CallFn = callGroqApi,
 ): Promise<AddressValidationResult> {
   const systemPrompt = buildSystemPrompt(companyName, domain, websiteAddress, searchCandidates);
   const raw = await callFn(systemPrompt, `Validate address candidates for ${companyName} (${domain}).`);

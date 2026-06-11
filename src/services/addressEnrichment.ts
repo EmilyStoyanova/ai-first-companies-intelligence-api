@@ -17,8 +17,10 @@ interface AddressCandidate {
 }
 
 // Detects street-level address content: named street indicators or explicit labels.
+// The ["'«»''""] class covers ASCII straight quotes and Unicode curly quotes so
+// that addresses like str. "Ilinden" or str. 'Ilinden' score correctly.
 const STREET_SIGNAL_RE =
-  /(?:ул|бул|пл|кв|ж\.к|жк)\.\s*\S|(?:ul|str|bul|blvd?)\.\s*\w|\b(?:street|avenue|boulevard|road|drive|lane|plaza)\b|(?:адрес|address|headquarters?)\s*:|офис\s+\d|office\s+\d/iu;
+  /(?:ул|бул|пл|кв|ж\.к|жк)\.\s*["'«»''""]?\S|(?:ul|str|bul|blvd?)\.\s*["'«»''""]?\w|\b(?:street|avenue|boulevard|road|drive|lane|plaza)\b|(?:адрес|address|headquarters?)\s*:|офис\s+\d|office\s+\d|,\s*No\.\s*\d/iu;
 
 // Postal code: Bulgarian 4-digit (1000–9999), Western EU 5-digit.
 // Not anchored — match anywhere in the text.
@@ -91,6 +93,22 @@ export function addressSimilarity(a: string, b: string): number {
   return overlap / Math.min(ta.size, tb.size);
 }
 
+// Reject personal-address phrases from people-search / social sites.
+const PERSONAL_ADDRESS_RE =
+  /\bhome address\b|\bcurrently lives\b|\bresides at\b|\bassociates and relatives\b/i;
+
+// Reject fragments ending with a US state abbreviation (", CA", ", TX", …).
+const US_STATE_SUFFIX_RE =
+  /,\s*(?:AL|AK|AZ|AR|CA|CO|CT|DE|FL|GA|HI|ID|IL|IN|IA|KS|KY|LA|ME|MD|MA|MI|MN|MS|MO|MT|NE|NV|NH|NJ|NM|NY|NC|ND|OH|OK|OR|PA|RI|SC|SD|TN|TX|UT|VT|VA|WA|WV|WI|WY)\b/;
+
+// Reject standalone 5-digit ZIP codes that are NOT preceded by "BG-" (Bulgarian postal codes are 4-digit).
+const US_ZIP_RE = /(?<!BG-\s*)\b\d{5}\b/;
+
+// Reject fragments that explicitly name a foreign country — these are partner/distributor addresses,
+// not the Bulgarian company's own address (e.g. "Rua Victória 308, Nova Lima, MG, Brazil").
+const FOREIGN_COUNTRY_RE =
+  /\b(?:Brazil|Brasil|Germany|Deutschland|China|France|Italia|Italy|España|Spain|Portugal|United\s+States|USA|United\s+Kingdom|UK|Australia|Canada|Japan|Russia|Россия|Netherlands|Belgium|Austria|Switzerland|Sweden|Norway|Denmark|Finland|Poland|Romania|Hungary|Czech|Slovakia|Serbia|Croatia|Greece|Turkey)\b/i;
+
 /**
  * Extract and score address candidates from search result titles + snippets.
  * Splits on newlines and pipe separators; deduplicates by similarity.
@@ -118,6 +136,12 @@ export function parseAddressCandidates(
       const cleaned = cleanAddressArtifacts(fragment.replace(/[,;]\s*$/, '').trim());
       if (cleaned.length < 5 || looksLikeTimeline(cleaned)) continue;
 
+      // Reject US / personal-data / foreign-country address fragments.
+      if (PERSONAL_ADDRESS_RE.test(cleaned)) continue;
+      if (US_STATE_SUFFIX_RE.test(cleaned)) continue;
+      if (US_ZIP_RE.test(cleaned)) continue;
+      if (FOREIGN_COUNTRY_RE.test(cleaned)) continue;
+
       const score = scoreAddress(cleaned, fullContext, companyName, domain);
       if (score < 50) continue;
 
@@ -135,12 +159,8 @@ export function parseAddressCandidates(
  *
  * Flow:
  *   1. Score the existing website location (if any).
- *   2. If website score ≥ 60, trust it and skip the search API entirely.
- *   3. Otherwise fire two search queries ("адрес" + "address").
- *   4. Compare website and best search candidate:
- *      - Similar addresses → keep website (direct source is more reliable).
- *      - Search score > website score + 20 → use search, log conflict note.
- *      - Otherwise → keep website.
+ *   2. If website score > 0 (any address found on site), trust it and skip search entirely.
+ *   3. Search is fired ONLY when website location is null or empty.
  *
  * The optional `searchFn` parameter enables test injection.
  */
@@ -162,7 +182,8 @@ export async function enrichAddress(
     ? scoreAddress(websiteLocation, undefined, profile.name, domain)
     : 0;
 
-  if (websiteScore >= 60) {
+  // Website address always takes priority — skip search entirely if any address was found.
+  if (websiteScore > 0) {
     console.log(`[address] ${domain} website location trusted (score=${websiteScore}), skipping search`);
     return { location: websiteLocation, source: 'website', confidence: websiteScore, searchCandidates: [] };
   }
@@ -190,46 +211,10 @@ export async function enrichAddress(
   const searchCandidates = deduped.map((c) => c.text);
 
   if (deduped.length === 0) {
-    if (websiteLocation && websiteScore > 0) {
-      console.log(`[address] ${domain} selected="${websiteLocation}" source=website confidence=${websiteScore}`);
-      return { location: websiteLocation, source: 'website', confidence: websiteScore, searchCandidates: [] };
-    }
     return { source: 'none', confidence: 0, searchCandidates: [] };
   }
 
   const best = deduped[0];
-
-  if (!websiteLocation || websiteScore === 0) {
-    console.log(`[address] ${domain} selected="${best.text}" source=search confidence=${best.score}`);
-    return { location: best.text, source: 'search', confidence: best.score, searchCandidates };
-  }
-
-  // Website has no street indicator (city-only, generic text) but search found
-  // a real postal address — upgrade unconditionally.
-  if (websiteScore < 50 && best.score >= 50) {
-    const note = `weak website="${websiteLocation}" replaced by search`;
-    console.log(`[address] ${domain} conflict — ${note} (search ${best.score} > websiteScore ${websiteScore})`);
-    return { location: best.text, source: 'search', confidence: best.score, note, searchCandidates };
-  }
-
-  const sim = addressSimilarity(websiteLocation, best.text);
-  if (sim >= 0.5) {
-    // Same address, different wording → keep website (it's the direct source)
-    console.log(
-      `[address] ${domain} selected="${websiteLocation}" source=website confidence=${websiteScore} (matches search)`,
-    );
-    return { location: websiteLocation, source: 'website', confidence: websiteScore, searchCandidates };
-  }
-
-  if (best.score > websiteScore + 20) {
-    // Search is meaningfully better → replace
-    const note = `website="${websiteLocation}" vs search="${best.text}"`;
-    console.log(
-      `[address] ${domain} conflict — ${note} → taking search (${best.score} > ${websiteScore}+20)`,
-    );
-    return { location: best.text, source: 'search', confidence: best.score, note, searchCandidates };
-  }
-
-  console.log(`[address] ${domain} selected="${websiteLocation}" source=website confidence=${websiteScore}`);
-  return { location: websiteLocation, source: 'website', confidence: websiteScore, searchCandidates };
+  console.log(`[address] ${domain} selected="${best.text}" source=search confidence=${best.score}`);
+  return { location: best.text, source: 'search', confidence: best.score, searchCandidates };
 }

@@ -37,6 +37,7 @@ interface ExportRow {
   loginProtected: string;
   emailSubject: string;
   outreachMessage: string;
+  campaignEmail: string;
 }
 
 async function fetchRows(batchId: string, tenantId: string): Promise<ExportRow[]> {
@@ -68,6 +69,7 @@ async function fetchRows(batchId: string, tenantId: string): Promise<ExportRow[]
     loginProtected:  c.profile?.loginProtected  ? 'Yes' : 'No',
     emailSubject:    c.personalizedContent?.emailSubject    ?? '',
     outreachMessage: c.personalizedContent?.fullMessage     ?? '',
+    campaignEmail:   c.profile?.campaignEmail               ?? '',
   }));
 }
 
@@ -103,6 +105,7 @@ export const ExportService = {
         { header: 'Login Protected',       key: 'loginProtected',  width: 15 },
         { header: 'Email Subject',         key: 'emailSubject',    width: 50 },
         { header: 'Outreach Message',      key: 'outreachMessage', width: 80 },
+        { header: 'Campaign Email',        key: 'campaignEmail',   width: 80 },
       ];
 
       sheet.addRows(rows);
@@ -116,7 +119,7 @@ export const ExportService = {
         'emails', 'phones', 'services', 'team', 'facebook', 'linkedin', 'socialLinks',
         'completionScore', 'crawlStatus', 'crawlNote',
         'loginProtected',
-        'emailSubject', 'outreachMessage',
+        'emailSubject', 'outreachMessage', 'campaignEmail',
       ];
 
       const escape = (v: string | number) => {

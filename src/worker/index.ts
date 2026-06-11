@@ -12,6 +12,7 @@ import { runLoginFallbackEnrichment } from '../services/loginFallbackEnrichment'
 import { discoverSites, SearchProviderError } from '../services/discovery';
 import { checkFreshness } from '../lib/freshness';
 import { generatePersonalizedContent } from '../services/personalization';
+import { generateCampaignEmail } from '../services/campaignEmailGeneration';
 import PgBoss from 'pg-boss';
 
 const CONCURRENCY = parseInt(process.env.WORKER_CONCURRENCY || '5', 10);
@@ -124,7 +125,7 @@ async function processSingleJob(job: PgBoss.JobWithMetadata<CrawlCompanyPayload>
     } catch { /* non-critical */ }
 
     try {
-      console.log(`[worker:address-validation] ${domain} ANTHROPIC_API_KEY=${!!process.env.ANTHROPIC_API_KEY}`);
+      console.log(`[worker:address-validation] ${domain} GROQ_API_KEY=${!!process.env.GROQ_API_KEY}`);
       const addrVal = await validateAddress(
         profile.name ?? domain,
         domain,
@@ -159,7 +160,7 @@ async function processSingleJob(job: PgBoss.JobWithMetadata<CrawlCompanyPayload>
     // verified results (confidence ≥ 70) they replace the regex-extracted set;
     // lower-confidence candidates are logged but not stored.
     try {
-      console.log(`[worker:email-validation] ${domain} ANTHROPIC_API_KEY=${!!process.env.ANTHROPIC_API_KEY}`);
+      console.log(`[worker:email-validation] ${domain} GROQ_API_KEY=${!!process.env.GROQ_API_KEY}`);
       const validationPage = selectPageForValidation(pages);
       if (validationPage) {
         const emailResult = await validateEmails(
@@ -221,6 +222,65 @@ async function processSingleJob(job: PgBoss.JobWithMetadata<CrawlCompanyPayload>
       console.warn(`[worker:services-validation] ${domain} failed — keeping extracted results:`, e);
     }
 
+    // 3g. Campaign email generation — tenant-specific B2B outreach email.
+    // Runs only when the profile has enough data and the tenant has sender info configured.
+    // Non-critical — failure never stops the crawl pipeline.
+    let campaignEmailText: string | undefined;
+    try {
+      const hasSufficientProfile = !!(profile.name && (profile.description || profile.services.length > 0));
+      if (hasSufficientProfile) {
+        const tenant = await prisma.tenant.findUnique({
+          where: { id: tenantId },
+          select: {
+            name: true,
+            website: true,
+            contactPersonName: true,
+            contactPersonTitle: true,
+            contactPersonEmail: true,
+            contactPersonPhone: true,
+          },
+        });
+        const hasSenderInfo = !!tenant?.contactPersonName;
+        if (hasSenderInfo && tenant) {
+          // Fallback to first user email if tenant.contactPersonEmail is not set
+          let senderEmail: string = tenant.contactPersonEmail ?? '';
+          if (!senderEmail) {
+            const firstUser = await prisma.user.findFirst({
+              where: { tenantId },
+              select: { email: true },
+              orderBy: { createdAt: 'asc' },
+            });
+            senderEmail = firstUser?.email ?? '';
+          }
+
+          const result = await generateCampaignEmail({
+            targetName:        profile.name ?? domain,
+            targetDomain:      domain,
+            targetDescription: profile.description ?? '',
+            targetServices:    profile.services,
+            targetLocation:    profile.location ?? '',
+            targetTeam:        Array.isArray(profile.team) ? profile.team as Array<{ name: string; position?: string }> : [],
+            senderCompanyName: tenant.name,
+            senderWebsite:     tenant.website ?? '',
+            senderContactName: tenant.contactPersonName!,
+            senderContactTitle: tenant.contactPersonTitle ?? '',
+            senderContactEmail: senderEmail,
+            senderContactPhone: tenant.contactPersonPhone ?? '',
+          });
+          if (result) {
+            campaignEmailText = result;
+            console.log(`[worker:campaign-email] ${domain} — generated (${result.length} chars)`);
+          }
+        } else {
+          console.log(`[worker:campaign-email] ${domain} — skipped (tenant sender info not configured)`);
+        }
+      } else {
+        console.log(`[worker:campaign-email] ${domain} — skipped (insufficient profile data)`);
+      }
+    } catch (e) {
+      console.warn(`[worker:campaign-email] ${domain} failed — skipping:`, e);
+    }
+
     // 4. Upsert CompanyProfile — preserve existing emails/phones if the new crawl found none.
     // A retry crawl that misses the contact page must not overwrite verified contact data.
     const existingProfile = await prisma.companyProfile.findUnique({
@@ -270,6 +330,7 @@ async function processSingleJob(job: PgBoss.JobWithMetadata<CrawlCompanyPayload>
         companyNameFromLogo: loginFallback?.companyNameFromLogo ?? undefined,
         sloganFromLogo:      loginFallback?.sloganFromLogo      ?? undefined,
         logoNameConfidence:  loginFallback?.logoNameConfidence  ?? 0,
+        campaignEmail:       campaignEmailText,
       },
       update: {
         name: upsertName,
@@ -290,6 +351,7 @@ async function processSingleJob(job: PgBoss.JobWithMetadata<CrawlCompanyPayload>
         companyNameFromLogo: loginFallback?.companyNameFromLogo ?? undefined,
         sloganFromLogo:      loginFallback?.sloganFromLogo      ?? undefined,
         logoNameConfidence:  loginFallback?.logoNameConfidence  ?? 0,
+        ...(campaignEmailText !== undefined ? { campaignEmail: campaignEmailText } : {}),
       },
     });
 

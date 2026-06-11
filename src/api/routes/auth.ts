@@ -37,7 +37,10 @@ const router = Router();
  *         description: Validation error or email already taken
  */
 router.post('/register', async (req: Request, res: Response): Promise<void> => {
-  const { email, password, tenantName } = req.body;
+  const {
+    email, password, tenantName,
+    website, contactPersonName, contactPersonTitle, contactPersonPhone,
+  } = req.body;
 
   if (!email || !password || !tenantName) {
     res.status(400).json({ error: 'email, password and tenantName are required' });
@@ -59,7 +62,16 @@ router.post('/register', async (req: Request, res: Response): Promise<void> => {
   const emailVerificationToken = uuidv4();
 
   const { user, tenant } = await prisma.$transaction(async (tx) => {
-    const tenant = await tx.tenant.create({ data: { name: tenantName } });
+    const tenant = await tx.tenant.create({
+      data: {
+        name: tenantName,
+        website:            website            || null,
+        contactPersonName:  contactPersonName  || null,
+        contactPersonTitle: contactPersonTitle || null,
+        contactPersonEmail: email,
+        contactPersonPhone: contactPersonPhone || null,
+      },
+    });
     const user = await tx.user.create({
       data: { email, passwordHash, tenantId: tenant.id, emailVerificationToken },
     });

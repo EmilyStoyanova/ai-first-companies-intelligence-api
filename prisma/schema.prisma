@@ -8,12 +8,17 @@ datasource db {
 }
 
 model Tenant {
-  id           String        @id @default(uuid())
-  name         String
-  weeklyQuota  Int           @default(1000)
-  weeklyUsage  Int           @default(0)
-  usageResetAt DateTime      @default(now())
-  createdAt    DateTime      @default(now())
+  id                  String        @id @default(uuid())
+  name                String
+  weeklyQuota         Int           @default(1000)
+  weeklyUsage         Int           @default(0)
+  usageResetAt        DateTime      @default(now())
+  createdAt           DateTime      @default(now())
+  website             String?
+  contactPersonName   String?
+  contactPersonTitle  String?
+  contactPersonEmail  String?
+  contactPersonPhone  String?
 
   crawlBatches    CrawlBatch[]
   tenantCompanies TenantCompany[]
@@ -116,6 +121,7 @@ model CompanyProfile {
   companyNameFromLogo String?
   sloganFromLogo      String?
   logoNameConfidence  Int      @default(0)
+  campaignEmail       String?
   updatedAt           DateTime @updatedAt
 
   company Company @relation(fields: [companyId], references: [id])

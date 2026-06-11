@@ -1,0 +1,6 @@
+ALTER TABLE "Tenant" ADD COLUMN IF NOT EXISTS "website" TEXT;
+ALTER TABLE "Tenant" ADD COLUMN IF NOT EXISTS "contactPersonName" TEXT;
+ALTER TABLE "Tenant" ADD COLUMN IF NOT EXISTS "contactPersonTitle" TEXT;
+ALTER TABLE "Tenant" ADD COLUMN IF NOT EXISTS "contactPersonEmail" TEXT;
+ALTER TABLE "Tenant" ADD COLUMN IF NOT EXISTS "contactPersonPhone" TEXT;
+ALTER TABLE "CompanyProfile" ADD COLUMN IF NOT EXISTS "campaignEmail" TEXT;

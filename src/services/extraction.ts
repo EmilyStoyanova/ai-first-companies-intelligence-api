@@ -347,13 +347,15 @@ function extractDescription(pages: CrawledPage[]): string | undefined {
 // A line must have a STREET INDICATOR to be considered an address.
 // This prevents matching years (2022), prices, or history sentences.
 const STREET_INDICATORS = [
-  /\b(?:str|ul|bul|blvd?|nab)\.\s*["«»]?\w/i,              // Latin Eastern European: ul. / str. (quotes allowed)
-  /\bsq\.\s*(?!(?:m|ft|in|km)(?:[.\s]|$))["«»]?\w/i,       // sq. (square) — exclude sq.m./sq.ft./sq.in. area units
-  /(?:ул|бул|пл|кв|ж\.к|жк)\.\s*["«»]?\S/iu,               // Cyrillic Bulgarian: ул., бул., пл., кв., ж.к.
+  /\b(?:str|ul|bul|blvd?|nab)\.\s*["'«»‘’“”]?\w/i, // Latin Eastern European: ul. / str. (straight + curly quotes allowed)
+  /\bsq\.\s*(?!(?:m|ft|in|km)(?:[.\s]|$))["'«»‘’“”]?\w/i, // sq. (square) — exclude area units
+  /(?:ул|бул|пл|кв|ж\.к|жк)\.\s*["'«»‘’“”]?\S/iu, // Cyrillic Bulgarian: ул., бул., пл., кв., ж.к.
   /\b(?:street|avenue|boulevard|road|drive|lane|plaza)\b/i,  // Western
   /(?<![a-zA-Z-])office\s+\d/i,                              // "Office 5" — requires digit after, avoids "back-office transformations"
   /\b(?:address|registered\s+office|headquarters?|hq)\s*:/i, // explicit Latin label
   /(?:адрес)\s*:/iu,                                          // explicit Cyrillic label: Адрес:
+  /\bBG-\d{4}\b/,                                             // Bulgarian BG-XXXX postal prefix (e.g. BG-3040 Beli Izvor)
+  /,\s*No\.\s*\d/,                                            // ", No. 1" building number (Eastern European style: "Shose st., No. 1")
 ];
 
 // Regex to detect an address label in a line and extract the address portion after it
@@ -412,6 +414,97 @@ export function cleanAddressArtifacts(raw: string): string {
   return s.replace(/[,;|.]\s*$/, '').trim();
 }
 
+// Build a full address string from a schema.org PostalAddress-like object.
+function buildFromPostalAddress(a: Record<string, unknown>): string | undefined {
+  const street = typeof a.streetAddress === 'string' ? a.streetAddress.trim() : '';
+  const city   = typeof a.addressLocality === 'string' ? a.addressLocality.trim() : '';
+  const postal = typeof a.postalCode === 'string' ? a.postalCode.trim() : '';
+  const region = typeof a.addressRegion === 'string' ? a.addressRegion.trim() : '';
+  if (!street) return city || region || undefined;
+  const cityPart = postal && city ? `${postal} ${city}` : city || postal || region;
+  return cityPart ? `${street}, ${cityPart}` : street;
+}
+
+// Recursively search a parsed JSON-LD value for a PostalAddress.
+function jsonLdToAddress(data: unknown): string | undefined {
+  if (!data || typeof data !== 'object') return undefined;
+  if (Array.isArray(data)) {
+    for (const item of data) { const a = jsonLdToAddress(item); if (a) return a; }
+    return undefined;
+  }
+  const obj = data as Record<string, unknown>;
+  if (Array.isArray(obj['@graph'])) {
+    for (const item of obj['@graph'] as unknown[]) { const a = jsonLdToAddress(item); if (a) return a; }
+  }
+  if (typeof obj.address === 'string' && obj.address.trim().length > 5) {
+    return cleanAddressArtifacts(obj.address.trim());
+  }
+  if (obj.address && typeof obj.address === 'object' && !Array.isArray(obj.address)) {
+    return buildFromPostalAddress(obj.address as Record<string, unknown>);
+  }
+  if (obj['@type'] === 'PostalAddress' || typeof obj.streetAddress === 'string') {
+    return buildFromPostalAddress(obj);
+  }
+  return undefined;
+}
+
+/**
+ * Extract a postal address from a single page using structured/embedded sources.
+ * Priority:
+ *   1. schema.org JSON-LD (most reliable — structured data)
+ *   2. data-address / data-location attributes on or near a Google Maps iframe
+ *   3. Sibling text inside the same container as a Google Maps iframe
+ *   4. URL-decoded parameters in the Google Maps iframe src (!2s / q=)
+ */
+function extractMapAddress($: cheerio.CheerioAPI): string | undefined {
+  // 1. JSON-LD structured data
+  let jsonLdAddr: string | undefined;
+  $('script[type="application/ld+json"]').each((_i, el) => {
+    if (jsonLdAddr) return;
+    try {
+      const result = jsonLdToAddress(JSON.parse($(el).text()) as unknown);
+      if (result) jsonLdAddr = result;
+    } catch { /* invalid JSON — skip */ }
+  });
+  if (jsonLdAddr) return jsonLdAddr;
+
+  const mapIframes = $('iframe[src*="google.com/maps"], iframe[src*="maps.google"]');
+  if (mapIframes.length === 0) return undefined;
+
+  let containerAddr: string | undefined;
+
+  mapIframes.each((_i, el) => {
+    if (containerAddr) return;
+
+    // 2. data-* attributes on the iframe itself or its direct parent
+    for (const attrName of ['data-address', 'data-location']) {
+      const val = $(el).attr(attrName) ?? $(el).parent().attr(attrName);
+      if (val?.trim()) {
+        const c = cleanAddressArtifacts(val.trim());
+        if (c.length > 5) { containerAddr = c; return; }
+      }
+    }
+
+    // 3. Sibling text nodes inside the same container
+    $(el).parent().children().each((_j, child) => {
+      if (containerAddr || child === el) return;
+      const siblingLines = $(child).text()
+        .split(/[\n\r]+/)
+        .map((l) => l.replace(/\s+/g, ' ').trim())
+        .filter((l) => l.length > 5 && l.length < 200);
+      for (const line of siblingLines) {
+        if (STREET_INDICATORS.some((re) => re.test(line))) {
+          containerAddr = cleanAddressArtifacts(line.replace(/[,;.]\s*$/, ''));
+          return;
+        }
+      }
+    });
+
+  });
+
+  return containerAddr;
+}
+
 function extractLocation(pages: CrawledPage[]): string | undefined {
   // 1. Semantic <address> HTML element
   for (const page of pages) {
@@ -428,7 +521,34 @@ function extractLocation(pages: CrawledPage[]): string | undefined {
     }
   }
 
-  // 2. Elements with explicit "address" in class (NOT "location" — too broad)
+  // 2. schema.org JSON-LD + Google Maps embed (structured/embedded sources)
+  for (const page of pages) {
+    if (!page.html) continue;
+    const $ = cheerio.load(page.html);
+    const mapAddr = extractMapAddress($);
+    if (mapAddr) return mapAddr;
+  }
+
+  // 3. <a> links whose href points to Google Maps and whose text contains an address.
+  // Handles cases like: <a href="maps.app.goo.gl/...">Address: str. "Ilinden" 3, Vratsa</a>
+  for (const page of pages) {
+    if (!page.html) continue;
+    const $ = cheerio.load(page.html);
+    let mapsLinkAddr: string | undefined;
+    $('a[href*="maps.app.goo.gl"], a[href*="maps.google.com"], a[href*="goo.gl/maps"]').each((_i, el) => {
+      if (mapsLinkAddr) return;
+      const linkText = $(el).text().replace(/\s+/g, ' ').trim();
+      if (linkText.length < 8 || linkText.length > 200) return;
+      if (!STREET_INDICATORS.some((re) => re.test(linkText))) return;
+      const labelMatch = linkText.match(ADDRESS_LABEL_RE);
+      const candidate = labelMatch ? labelMatch[1].trim() : linkText;
+      const cleaned = cleanAddressArtifacts(candidate.replace(/[,;.]\s*$/, '').trim());
+      if (cleaned.length >= 8) mapsLinkAddr = cleaned;
+    });
+    if (mapsLinkAddr) return mapsLinkAddr;
+  }
+
+  // 4. Elements with explicit "address" in class (NOT "location" — too broad)
   // Split raw text by newlines BEFORE collapsing whitespace so we can isolate
   // the street line from surrounding headings/breadcrumbs in the same element.
   for (const page of pages) {
@@ -444,9 +564,21 @@ function extractLocation(pages: CrawledPage[]): string | undefined {
         .map((l) => l.replace(/\s+/g, ' ').trim())
         .filter((l) => l.length > 5 && l.length < 200 && !looksLikeCss(l) && !l.includes('<'));
       // Prefer the line that contains a street indicator
-      const streetLine = lines.find((l) => STREET_INDICATORS.some((re) => re.test(l)));
-      if (streetLine) {
-        found = cleanAddressArtifacts(streetLine.replace(/[,;]\s*$/, ''));
+      const streetIdx = lines.findIndex((l) => STREET_INDICATORS.some((re) => re.test(l)));
+      if (streetIdx !== -1) {
+        let streetText = lines[streetIdx].replace(/[,;]\s*$/, '');
+        // If the next line is a city/ZIP continuation (no street indicator, contains 4-digit postal code),
+        // append it — addresses like "ул. X 34\nМонтана, 3400" span two lines.
+        const nextLine = lines[streetIdx + 1];
+        if (
+          nextLine &&
+          nextLine.length < 60 &&
+          /\b\d{4}\b/.test(nextLine) &&
+          !STREET_INDICATORS.some((re) => re.test(nextLine))
+        ) {
+          streetText += ', ' + nextLine.replace(/[,;.]\s*$/, '').trim();
+        }
+        found = cleanAddressArtifacts(streetText);
       } else if (lines.length > 0) {
         // Fallback: shortest non-empty line (likely the address, not surrounding headings).
         // Reject timeline/history lines — a history section sometimes carries
@@ -460,8 +592,11 @@ function extractLocation(pages: CrawledPage[]): string | undefined {
     if (found) return found;
   }
 
-  // 3. Text-based: lines that contain a street indicator (not just any 4-digit number)
-  const combined = pages.map((p) => p.text).join('\n');
+  // 5. Text-based: lines that contain a street indicator (not just any 4-digit number)
+  // Exclude store-locator pages — they list many branch addresses and poison the primary location.
+  const STORE_PAGE_RE = /\/stores?\b|\/locations?\b|\/branches?\b|\/shop-?locator|\/dealers?\b|\/points?-of-sale/i;
+  const nonStorePages = pages.filter((p) => !STORE_PAGE_RE.test(p.url));
+  const combined = (nonStorePages.length > 0 ? nonStorePages : pages).map((p) => p.text).join('\n');
   const lines = combined
     .split('\n')
     .map((l) => l.replace(/\s+/g, ' ').trim())
@@ -470,7 +605,8 @@ function extractLocation(pages: CrawledPage[]): string | undefined {
   const addresses: string[] = [];
   const seenKeys = new Set<string>();
 
-  for (const line of lines) {
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
     // Must have a street indicator — this rejects "established in 2022" etc.
     if (!STREET_INDICATORS.some((re) => re.test(line))) continue;
     if (looksLikeCss(line)) continue;
@@ -499,14 +635,28 @@ function extractLocation(pages: CrawledPage[]): string | undefined {
 
     const cleaned = cleanAddressArtifacts(candidate.replace(/[,;.]\s*$/, '').trim());
     if (cleaned.length < 5) continue;
-    const key = cleaned.toLowerCase().replace(/\s/g, '');
+
+    // If the next line is a city/ZIP continuation (no street indicator, contains 4-digit postal
+    // code), append it — addresses like "ул. X 34\nМонтана, 3400" span two text lines.
+    let fullAddress = cleaned;
+    const nextLine = lines[i + 1];
+    if (
+      nextLine &&
+      nextLine.length < 60 &&
+      /\b\d{4}\b/.test(nextLine) &&
+      !STREET_INDICATORS.some((re) => re.test(nextLine))
+    ) {
+      fullAddress = cleaned + ', ' + nextLine.replace(/[,;.]\s*$/, '').trim();
+    }
+
+    const key = fullAddress.toLowerCase().replace(/\s/g, '');
     if (seenKeys.has(key)) continue;
     seenKeys.add(key);
-    addresses.push(cleaned);
+    addresses.push(fullAddress);
     if (addresses.length >= 2) break;
   }
 
-  return addresses.length ? addresses.join(' | ') : undefined;
+  return addresses.length ? addresses[0] : undefined;
 }
 
 // ── Services ──────────────────────────────────────────────────────────────────

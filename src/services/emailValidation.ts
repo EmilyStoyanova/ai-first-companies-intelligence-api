@@ -77,32 +77,33 @@ function buildSystemPrompt(companyName: string, domain: string, pageUrl: string)
     .replace('{{pageUrl}}', pageUrl);
 }
 
-async function callClaudeApi(systemPrompt: string, userContent: string): Promise<string> {
-  const apiKey = process.env.ANTHROPIC_API_KEY;
-  if (!apiKey) throw new Error('ANTHROPIC_API_KEY not set');
+async function callGroqApi(systemPrompt: string, userContent: string): Promise<string> {
+  const apiKey = process.env.GROQ_API_KEY;
+  if (!apiKey) throw new Error('GROQ_API_KEY not set');
 
-  const res = await fetch('https://api.anthropic.com/v1/messages', {
+  const res = await fetch('https://api.groq.com/openai/v1/chat/completions', {
     method: 'POST',
     headers: {
       'content-type': 'application/json',
-      'x-api-key': apiKey,
-      'anthropic-version': '2023-06-01',
+      'authorization': `Bearer ${apiKey}`,
     },
     body: JSON.stringify({
-      model: 'claude-sonnet-4-20250514',
+      model: 'llama-3.3-70b-versatile',
       max_tokens: 1024,
-      system: systemPrompt,
-      messages: [{ role: 'user', content: userContent }],
+      messages: [
+        { role: 'system', content: systemPrompt },
+        { role: 'user', content: userContent },
+      ],
     }),
   });
 
   if (!res.ok) {
     const body = await res.text().catch(() => '');
-    throw new Error(`Claude API responded ${res.status}: ${body.slice(0, 200)}`);
+    throw new Error(`Groq API responded ${res.status}: ${body.slice(0, 200)}`);
   }
 
-  const data = await res.json() as { content: Array<{ type: string; text: string }> };
-  return data.content.find((b) => b.type === 'text')?.text ?? '';
+  const data = await res.json() as { choices: Array<{ message: { content: string } }> };
+  return data.choices[0]?.message?.content ?? '';
 }
 
 function parseResponse(raw: string): EmailValidationResult {
@@ -177,7 +178,7 @@ export async function validateEmails(
   domain: string,
   pageUrl: string,
   htmlContent: string,
-  callFn: CallFn = callClaudeApi,
+  callFn: CallFn = callGroqApi,
 ): Promise<EmailValidationResult> {
   const systemPrompt = buildSystemPrompt(companyName, domain, pageUrl);
   const userContent = htmlContent.length > HTML_TRUNCATE_CHARS
