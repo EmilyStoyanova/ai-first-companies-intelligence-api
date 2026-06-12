@@ -12,6 +12,7 @@ import companiesRouter from './routes/companies';
 import exportsRouter from './routes/exports';
 import personaRouter from './routes/persona';
 import tenantRouter from './routes/tenant';
+import templatesRouter from './routes/templates';
 import { logSmtpConfig } from '../lib/email';
 
 // ── Startup environment validation ────────────────────────────────────────────
@@ -49,6 +50,7 @@ app.use('/api/companies', companiesRouter);
 app.use('/api/exports', exportsRouter);
 app.use('/api/persona-searches', personaRouter);
 app.use('/api/tenant', tenantRouter);
+app.use('/api/templates', templatesRouter);
 
 app.use((req, res) => {
   res.status(404).json({ error: 'Not found' });

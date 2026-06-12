@@ -24,7 +24,7 @@ async function processJob(jobs: PgBoss.JobWithMetadata<CrawlCompanyPayload>[]): 
 }
 
 async function processSingleJob(job: PgBoss.JobWithMetadata<CrawlCompanyPayload>): Promise<void> {
-  const { companyId, domain, baseUrl, batchId, tenantId } = job.data;
+  const { companyId, domain, baseUrl, batchId, tenantId, templateId } = job.data;
   console.log(`[worker] processing ${domain} (${companyId})`);
 
   // Mark company as crawling
@@ -225,57 +225,82 @@ async function processSingleJob(job: PgBoss.JobWithMetadata<CrawlCompanyPayload>
     // 3g. Campaign email generation — tenant-specific B2B outreach email.
     // Runs only when the profile has enough data and the tenant has sender info configured.
     // Non-critical — failure never stops the crawl pipeline.
+    // templateBodyResolved: undefined = not yet determined (error), string = template found, null = no template
     let campaignEmailText: string | undefined;
+    let templateBodyResolved: string | null | undefined;
     try {
-      const hasSufficientProfile = !!(profile.name && (profile.description || profile.services.length > 0));
-      if (hasSufficientProfile) {
-        const tenant = await prisma.tenant.findUnique({
-          where: { id: tenantId },
-          select: {
-            name: true,
-            website: true,
-            contactPersonName: true,
-            contactPersonTitle: true,
-            contactPersonEmail: true,
-            contactPersonPhone: true,
-          },
+      // Resolve template first — this determines whether to generate at all.
+      if (templateId) {
+        const tmpl = await prisma.emailTemplate.findFirst({
+          where: { id: templateId, tenantId },
+          select: { body: true },
         });
-        const hasSenderInfo = !!tenant?.contactPersonName;
-        if (hasSenderInfo && tenant) {
-          // Fallback to first user email if tenant.contactPersonEmail is not set
-          let senderEmail: string = tenant.contactPersonEmail ?? '';
-          if (!senderEmail) {
-            const firstUser = await prisma.user.findFirst({
-              where: { tenantId },
-              select: { email: true },
-              orderBy: { createdAt: 'asc' },
-            });
-            senderEmail = firstUser?.email ?? '';
-          }
+        templateBodyResolved = tmpl?.body ?? null;
+      } else {
+        const defaultTmpl = await prisma.emailTemplate.findFirst({
+          where: { tenantId, isDefault: true },
+          select: { body: true },
+        });
+        templateBodyResolved = defaultTmpl?.body ?? null;
+      }
 
-          const result = await generateCampaignEmail({
-            targetName:        profile.name ?? domain,
-            targetDomain:      domain,
-            targetDescription: profile.description ?? '',
-            targetServices:    profile.services,
-            targetLocation:    profile.location ?? '',
-            targetTeam:        Array.isArray(profile.team) ? profile.team as Array<{ name: string; position?: string }> : [],
-            senderCompanyName: tenant.name,
-            senderWebsite:     tenant.website ?? '',
-            senderContactName: tenant.contactPersonName!,
-            senderContactTitle: tenant.contactPersonTitle ?? '',
-            senderContactEmail: senderEmail,
-            senderContactPhone: tenant.contactPersonPhone ?? '',
+      if (!templateBodyResolved) {
+        console.log(`[worker:campaign-email] ${domain} — skipped (no template configured)`);
+      } else {
+        const hasSufficientProfile = !!(profile.name && (profile.description || profile.services.length > 0));
+        if (hasSufficientProfile) {
+          const tenant = await prisma.tenant.findUnique({
+            where: { id: tenantId },
+            select: {
+              name: true,
+              website: true,
+              contactPersonName: true,
+              contactPersonTitle: true,
+              contactPersonEmail: true,
+              contactPersonPhone: true,
+            },
           });
-          if (result) {
-            campaignEmailText = result;
-            console.log(`[worker:campaign-email] ${domain} — generated (${result.length} chars)`);
+          const hasSenderInfo = !!tenant?.contactPersonName;
+          if (hasSenderInfo && tenant) {
+            // Fallback to first user email if tenant.contactPersonEmail is not set
+            let senderEmail: string = tenant.contactPersonEmail ?? '';
+            if (!senderEmail) {
+              const firstUser = await prisma.user.findFirst({
+                where: { tenantId },
+                select: { email: true },
+                orderBy: { createdAt: 'asc' },
+              });
+              senderEmail = firstUser?.email ?? '';
+            }
+
+            const result = await generateCampaignEmail(
+              {
+                targetName:        profile.name ?? domain,
+                targetDomain:      domain,
+                targetDescription: profile.description ?? '',
+                targetServices:    profile.services,
+                targetLocation:    profile.location ?? '',
+                targetTeam:        Array.isArray(profile.team) ? profile.team as Array<{ name: string; position?: string }> : [],
+                senderCompanyName: tenant.name,
+                senderWebsite:     tenant.website ?? '',
+                senderContactName: tenant.contactPersonName!,
+                senderContactTitle: tenant.contactPersonTitle ?? '',
+                senderContactEmail: senderEmail,
+                senderContactPhone: tenant.contactPersonPhone ?? '',
+              },
+              undefined,
+              templateBodyResolved,
+            );
+            if (result) {
+              campaignEmailText = result;
+              console.log(`[worker:campaign-email] ${domain} — generated (${result.length} chars)`);
+            }
+          } else {
+            console.log(`[worker:campaign-email] ${domain} — skipped (tenant sender info not configured)`);
           }
         } else {
-          console.log(`[worker:campaign-email] ${domain} — skipped (tenant sender info not configured)`);
+          console.log(`[worker:campaign-email] ${domain} — skipped (insufficient profile data)`);
         }
-      } else {
-        console.log(`[worker:campaign-email] ${domain} — skipped (insufficient profile data)`);
       }
     } catch (e) {
       console.warn(`[worker:campaign-email] ${domain} failed — skipping:`, e);
@@ -351,7 +376,12 @@ async function processSingleJob(job: PgBoss.JobWithMetadata<CrawlCompanyPayload>
         companyNameFromLogo: loginFallback?.companyNameFromLogo ?? undefined,
         sloganFromLogo:      loginFallback?.sloganFromLogo      ?? undefined,
         logoNameConfidence:  loginFallback?.logoNameConfidence  ?? 0,
-        ...(campaignEmailText !== undefined ? { campaignEmail: campaignEmailText } : {}),
+        // No template → explicitly null; template + generation failed → preserve existing; generated → store
+        ...(templateBodyResolved == null
+          ? { campaignEmail: null }
+          : campaignEmailText !== undefined
+            ? { campaignEmail: campaignEmailText }
+            : {}),
       },
     });
 
@@ -447,7 +477,7 @@ async function updateBatchProgress(batchId: string): Promise<void> {
 async function processDiscoverJob(
   job: PgBoss.JobWithMetadata<DiscoverPersonaPayload>
 ): Promise<void> {
-  const { batchId, tenantId, persona, location, keywords, maxResults, forceRecrawl } = job.data;
+  const { batchId, tenantId, persona, location, keywords, maxResults, forceRecrawl, templateId } = job.data;
   console.log(`[worker/discover] starting discovery: "${persona}" in "${location}"`);
 
   try {
@@ -519,7 +549,7 @@ async function processDiscoverJob(
       } else {
         console.log(`[discover] recrawling ${site.domain} — ${freshness.reason}`);
         await enqueueCrawlJob(
-          { companyId: company.id, domain: site.domain, baseUrl, batchId, tenantId },
+          { companyId: company.id, domain: site.domain, baseUrl, batchId, tenantId, templateId },
           crawlQueue
         );
         jobsEnqueued++;

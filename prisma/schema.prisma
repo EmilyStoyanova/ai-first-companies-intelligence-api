@@ -23,6 +23,7 @@ model Tenant {
   crawlBatches    CrawlBatch[]
   tenantCompanies TenantCompany[]
   users           User[]
+  emailTemplates  EmailTemplate[]
 }
 
 model User {
@@ -81,10 +82,12 @@ model CrawlBatch {
   processedCompanies   Int             @default(0)
   completionPercentage Float           @default(0)
   exportPath           String?
+  templateId           String?
   createdAt            DateTime        @default(now())
   updatedAt            DateTime        @updatedAt
 
   tenant               Tenant               @relation(fields: [tenantId], references: [id])
+  template             EmailTemplate?       @relation(fields: [templateId], references: [id], onDelete: SetNull)
   tenantCompanies      TenantCompany[]
   discoveryCandidates  DiscoveryCandidate[]
 }
@@ -179,4 +182,18 @@ enum CrawlStatus {
   COMPLETED
   FAILED
   BLOCKED
+}
+
+model EmailTemplate {
+  id        String   @id @default(uuid())
+  tenantId  String
+  name      String
+  subject   String
+  body      String
+  isDefault Boolean  @default(false)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  tenant  Tenant       @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  batches CrawlBatch[]
 }

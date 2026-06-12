@@ -12,6 +12,7 @@ export interface CrawlCompanyPayload {
   baseUrl: string;
   batchId: string;
   tenantId: string;
+  templateId?: string;
 }
 
 export interface DiscoverPersonaPayload {
@@ -22,6 +23,7 @@ export interface DiscoverPersonaPayload {
   keywords?: string;
   maxResults?: number;
   forceRecrawl?: boolean;
+  templateId?: string;
 }
 
 export interface PersonalizeCompanyPayload {

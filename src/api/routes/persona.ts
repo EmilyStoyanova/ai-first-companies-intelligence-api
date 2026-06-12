@@ -49,12 +49,13 @@ const router = Router();
  *         description: Weekly quota exceeded
  */
 router.post('/', requireAuth, requireVerified, async (req: Request, res: Response): Promise<void> => {
-  const { persona, location, keywords, maxResults: rawMax, force_recrawl } = req.body as {
+  const { persona, location, keywords, maxResults: rawMax, force_recrawl, templateId: rawTemplateId } = req.body as {
     persona?: string;
     location?: string;
     keywords?: string;
     maxResults?: number;
     force_recrawl?: boolean;
+    templateId?: string;
   };
 
   if (!persona?.trim() || !location?.trim()) {
@@ -88,6 +89,22 @@ router.post('/', requireAuth, requireVerified, async (req: Request, res: Respons
       return;
     }
 
+    // Resolve templateId: explicit → default for tenant → null
+    let resolvedTemplateId: string | null = null;
+    if (rawTemplateId) {
+      const tmpl = await prisma.emailTemplate.findFirst({
+        where: { id: rawTemplateId, tenantId },
+        select: { id: true },
+      });
+      resolvedTemplateId = tmpl?.id ?? null;
+    } else {
+      const defaultTmpl = await prisma.emailTemplate.findFirst({
+        where: { tenantId, isDefault: true },
+        select: { id: true },
+      });
+      resolvedTemplateId = defaultTmpl?.id ?? null;
+    }
+
     const displayName = `${persona.trim()} – ${location.trim()}`;
 
     const batch = await prisma.crawlBatch.create({
@@ -103,6 +120,7 @@ router.post('/', requireAuth, requireVerified, async (req: Request, res: Respons
         },
         status: 'PROCESSING',
         totalCompanies: 0,
+        ...(resolvedTemplateId ? { templateId: resolvedTemplateId } : {}),
       },
     });
 
@@ -116,6 +134,7 @@ router.post('/', requireAuth, requireVerified, async (req: Request, res: Respons
         keywords: keywords?.trim(),
         maxResults,
         forceRecrawl: Boolean(force_recrawl),
+        templateId: resolvedTemplateId ?? undefined,
       },
       queue
     );

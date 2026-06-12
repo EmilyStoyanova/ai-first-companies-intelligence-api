@@ -29,10 +29,10 @@ function uploadSingle(req: Request, res: Response, next: NextFunction): void {
 }
 
 function sanitizeFilename(original: string): string {
-  // Strip any directory components the client may have included, then replace
-  // every character that is not alphanumeric / dot / underscore / hyphen.
+  // Strip directory components; allow Unicode letters/digits (covers Cyrillic, etc.)
+  // plus dot, underscore, hyphen. Replace anything else (slashes, null bytes, etc.) with _.
   const base = path.basename(original);
-  return base.replace(/[^a-zA-Z0-9._-]/g, '_') || 'upload';
+  return base.replace(/[^\p{L}\p{N}._-]/gu, '_') || 'upload';
 }
 
 function normalizeDomain(raw: string): string {
@@ -162,7 +162,11 @@ router.post(
       return;
     }
 
-    const ext = path.extname(req.file.originalname).toLowerCase();
+    // Multer decodes multipart filenames as Latin-1; modern browsers send UTF-8.
+    // Re-encode to recover the correct Unicode filename (Cyrillic, etc.).
+    const originalname = Buffer.from(req.file.originalname, 'latin1').toString('utf8');
+
+    const ext = path.extname(originalname).toLowerCase();
     if (!['.csv', '.xlsx', '.xls'].includes(ext)) {
       res.status(400).json({ error: 'Only CSV and Excel files are supported' });
       return;
@@ -181,6 +185,23 @@ router.post(
           invalidRows,
         });
         return;
+      }
+
+      // Resolve templateId: explicit → default for tenant → null
+      const requestedTemplateId = req.body?.templateId as string | undefined;
+      let resolvedTemplateId: string | null = null;
+      if (requestedTemplateId) {
+        const tmpl = await prisma.emailTemplate.findFirst({
+          where: { id: requestedTemplateId, tenantId },
+          select: { id: true },
+        });
+        resolvedTemplateId = tmpl?.id ?? null;
+      } else {
+        const defaultTmpl = await prisma.emailTemplate.findFirst({
+          where: { tenantId, isDefault: true },
+          select: { id: true },
+        });
+        resolvedTemplateId = defaultTmpl?.id ?? null;
       }
 
       // Check quota
@@ -209,7 +230,7 @@ router.post(
       // Save uploaded file
       const storedPath = StorageService.upload(
         `uploads/${tenantId}`,
-        `${Date.now()}-${sanitizeFilename(req.file.originalname)}`,
+        `${Date.now()}-${sanitizeFilename(originalname)}`,
         req.file.path
       );
 
@@ -218,9 +239,10 @@ router.post(
         data: {
           tenantId,
           filePath: storedPath,
-          fileName: req.file.originalname,
+          fileName: originalname,
           status: 'PROCESSING',
           totalCompanies: domains.length,
+          ...(resolvedTemplateId ? { templateId: resolvedTemplateId } : {}),
         },
       });
 
@@ -257,7 +279,7 @@ router.post(
         } else {
           console.log(`[upload] recrawling ${domain} — ${freshness.reason}`);
           await enqueueCrawlJob(
-            { companyId: company.id, domain, baseUrl, batchId: batch.id, tenantId },
+            { companyId: company.id, domain, baseUrl, batchId: batch.id, tenantId, templateId: resolvedTemplateId ?? undefined },
             queue
           );
           jobsEnqueued++;
@@ -683,7 +705,7 @@ router.post('/:id/re-enrich', requireAuth, requireVerified, async (req: Request,
     const queue = await getQueue();
     for (const company of companies) {
       await enqueueCrawlJob(
-        { companyId: company.id, domain: company.domain, baseUrl: company.baseUrl, batchId: id, tenantId },
+        { companyId: company.id, domain: company.domain, baseUrl: company.baseUrl, batchId: id, tenantId, templateId: batch.templateId ?? undefined },
         queue,
       );
     }
