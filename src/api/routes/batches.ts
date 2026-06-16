@@ -247,12 +247,11 @@ router.post(
       });
 
       const queue = await getQueue();
-      let jobsEnqueued = 0;
 
-      for (const domain of domains) {
+      // Process all domains in parallel — avoids N×3 sequential DB roundtrips.
+      const jobResults = await Promise.all(domains.map(async (domain) => {
         const baseUrl = buildBaseUrl(domain);
 
-        // Upsert company — include profile so freshness check can evaluate quality
         const company = await prisma.company.upsert({
           where: { domain },
           create: { domain, baseUrl },
@@ -260,8 +259,6 @@ router.post(
           include: { profile: true },
         });
 
-        // Link to tenant — one record per (tenant, company, batch); re-uploading the same
-        // domain in a new batch creates a new row without overwriting the old batch pointer.
         await prisma.tenantCompany.createMany({
           data: [{ tenantId, companyId: company.id, sourceBatchId: batch.id }],
           skipDuplicates: true,
@@ -271,20 +268,18 @@ router.post(
 
         if (freshness.skip) {
           console.log(`[upload] skipped fresh company ${domain} — ${freshness.reason}`);
-          // Reuse existing crawl data — count as processed immediately
-          await prisma.crawlBatch.update({
-            where: { id: batch.id },
-            data: { processedCompanies: { increment: 1 } },
-          });
-        } else {
-          console.log(`[upload] recrawling ${domain} — ${freshness.reason}`);
-          await enqueueCrawlJob(
-            { companyId: company.id, domain, baseUrl, batchId: batch.id, tenantId, templateId: resolvedTemplateId ?? undefined },
-            queue
-          );
-          jobsEnqueued++;
+          return false;
         }
-      }
+
+        console.log(`[upload] recrawling ${domain} — ${freshness.reason}`);
+        await enqueueCrawlJob(
+          { companyId: company.id, domain, baseUrl, batchId: batch.id, tenantId, templateId: resolvedTemplateId ?? undefined },
+          queue,
+        );
+        return true;
+      }));
+
+      const jobsEnqueued = jobResults.filter(Boolean).length;
 
       // Update batch completion percentage
       const processed = domains.length - jobsEnqueued;

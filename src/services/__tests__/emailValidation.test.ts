@@ -1,7 +1,7 @@
 /**
  * Tests for AI-assisted email validation.
  *
- * validateEmails() calls Claude API with the page HTML and returns:
+ * validateEmails() classifies already-extracted emails via LLM and returns:
  *   - verified:   emails with confidence >= 70 (stored in profile)
  *   - unverified: emails with confidence < 70  (logged, not stored)
  *
@@ -125,8 +125,7 @@ async function runIntegrationTests(): Promise<void> {
     const result = await validateEmails(
       'Yotov Stone',
       'yotovstone.com',
-      'https://yotovstone.com/kontakti',
-      '<html>Contact: info@yotovstone.com</html>',
+      ['info@yotovstone.com'],
       mockCall(response),
     );
 
@@ -155,8 +154,7 @@ async function runIntegrationTests(): Promise<void> {
     const result = await validateEmails(
       'Yotov Stone',
       'yotovstone.com',
-      'https://yotovstone.com/kontakti',
-      '<html>info@yotovstone.com</html>',
+      ['info@yotovstone.com'],
       mockCall(response),
     );
 
@@ -187,8 +185,7 @@ async function runIntegrationTests(): Promise<void> {
     const result = await validateEmails(
       'Firma BG',
       'firma-bg.com',
-      'https://firma-bg.com/kontakti',
-      '<html>firma123@abv.bg</html>',
+      ['firma123@abv.bg'],
       mockCall(response),
     );
 
@@ -213,8 +210,7 @@ async function runIntegrationTests(): Promise<void> {
     const result = await validateEmails(
       'Company',
       'company.com',
-      'https://company.com/contact',
-      '<html>emails here</html>',
+      ['info@company.com', 'sales@company.com', 'old@company.com', 'noreply@company.com'],
       mockCall(response),
     );
 
@@ -235,8 +231,7 @@ async function runIntegrationTests(): Promise<void> {
     const result = await validateEmails(
       'Mystery Corp',
       'mystery.bg',
-      'https://mystery.bg/',
-      '<html>No email here</html>',
+      [],
       mockCall(response),
     );
 
@@ -251,8 +246,7 @@ async function runIntegrationTests(): Promise<void> {
     const result = await validateEmails(
       'Company',
       'company.com',
-      'https://company.com/contact',
-      '<html></html>',
+      [],
       mockCall('This is not JSON at all'),
     );
 
@@ -273,8 +267,7 @@ async function runIntegrationTests(): Promise<void> {
     const result = await validateEmails(
       'Test',
       'test.com',
-      'https://test.com/contact',
-      '<html>info@test.com</html>',
+      ['info@test.com'],
       mockCall(response),
     );
 
@@ -303,8 +296,7 @@ async function runIntegrationTests(): Promise<void> {
     const result = await validateEmails(
       'Yotov Stone',
       'yotovstone.com',
-      'https://yotovstone.com/kontakti',
-      '<html>info@yotovstones.com</html>',
+      ['info@yotovstones.com'],
       mockCall(response),
     );
 
@@ -325,8 +317,7 @@ async function runIntegrationTests(): Promise<void> {
     const result = await validateEmails(
       'Company',
       'company.com',
-      'https://company.com/',
-      '<html>INFO@Company.COM</html>',
+      ['INFO@Company.COM'],
       mockCall(response),
     );
 

@@ -12,65 +12,42 @@ export interface ValidatedServicesResult {
   notes?: string;
 }
 
-// htmlContent is passed as the user message, not inlined in the system prompt.
-const SYSTEM_PROMPT_TEMPLATE = `You are a data extraction specialist for a B2B lead generation system \
-that crawls Bulgarian company websites.
+const SYSTEM_PROMPT_TEMPLATE = `You are a B2B data extraction assistant for Bulgarian companies.
 
-Your task is to extract the business services, products, and activities of the company \
-from the provided HTML content or text.
+Extract concrete business services, products, or activities from the provided page text.
 
 CONTEXT:
-- Company name: {{companyName}}
-- Company domain: {{domain}}
-- Page URL: {{pageUrl}}
+- Company: {{companyName}} ({{domain}})
+- Page: {{pageUrl}}
 
-RULES - INCLUDE:
-1. Core services and products the company actively offers or sells
-2. Main business activities and areas of expertise
-3. Brands the company officially represents, distributes, or resells
-4. The primary industry/sector the company operates in
-5. A brief characterisation of who their customers are
+NOTE: Bulgarian SMBs often describe their business activities in the "За нас" (About Us) section rather than a dedicated services page. Extract the company's actual work from whichever section describes it.
 
-RULES - EXCLUDE:
-1. Generic phrases like "quality service", "professional team", or "customer satisfaction"
-2. Services from partner or client companies (unless the company is explicitly a reseller)
-3. Content inside testimonials, case studies, or blog posts about client industries
-4. Aspirational or future services not currently offered
-5. Legal boilerplate, cookie notices, or navigation labels
+RULES:
+1. INCLUDE only specific services or products the company actually sells or performs.
+2. Each entry must be concise — max 80 characters. Distill longer descriptions to the core activity.
+3. NEVER include navigation labels such as: За Нас, Контакти, Меню, Начало, Мисия, Визия, Отговорност, Сертификати, Екип, Новини, Блог, Галерия, Партньори, Кариери, About, Contact, Home, Team, or any similar page/menu names.
+4. NEVER include calls-to-action: Виж повече, Прочети, Read more, Свържи се с нас, Научи повече, Поръчай, Запитване, or similar phrases.
+5. NEVER include duplicates — if the same item appears multiple times in the text, list it only once.
+6. Aim for 3–8 distinct entries. If you find more than 10 candidates, you are likely including noise — be more selective.
+7. If the page does not clearly describe what the company sells or does, set no_services_found: true and confidence below 35.
 
-EXTRACTION SPECIFICS:
-- Extract concrete, specific services (e.g. "Изграждане на фотоволтаични системи" not "Услуги")
-- For retailers/distributors: list the brands they carry under represented_brands
-- target_customers: short description of who buys from them \
-(e.g. "B2B строителни фирми", "Крайни клиенти — домакинства", "Хотели и ресторанти")
-- primary_industry: single most accurate industry label in English \
-(e.g. "Construction", "IT Services", "Food & Beverage", "Manufacturing", "Retail")
-- confidence: your overall confidence that the extracted data is correct (0-100); \
-use lower values when the page has very little content or is mostly navigation
-
-OUTPUT FORMAT (JSON only, no explanation):
+OUTPUT (strict JSON only, no markdown fences):
 {
-  "services": [
-    "service or product 1",
-    "service or product 2"
-  ],
-  "represented_brands": [
-    "Brand Name 1"
-  ],
+  "services": ["конкретна услуга 1", "конкретна услуга 2"],
+  "represented_brands": ["Brand 1"],
   "primary_industry": "Construction",
-  "target_customers": "brief description",
+  "target_customers": "кратко описание",
   "no_services_found": false,
-  "confidence": 0-100,
-  "notes": "optional: anything worth flagging"
+  "confidence": 0-100
 }`;
 
-// Footer-biased truncation: first 25K + last 25K chars.
-const HTML_HALF = 25_000;
-const CONFIDENCE_THRESHOLD = 50;
+const TEXT_HALF = 4_000;
 
-function truncateHtml(html: string): string {
-  if (html.length <= HTML_HALF * 2) return html;
-  return html.slice(0, HTML_HALF) + '\n[...truncated...]\n' + html.slice(-HTML_HALF);
+const CONFIDENCE_THRESHOLD = 35;
+
+function truncateText(text: string): string {
+  if (text.length <= TEXT_HALF * 2) return text;
+  return text.slice(0, TEXT_HALF) + '\n[...truncated...]\n' + text.slice(-TEXT_HALF);
 }
 
 function buildSystemPrompt(companyName: string, domain: string, pageUrl: string): string {
@@ -84,29 +61,42 @@ async function callGroqApi(systemPrompt: string, userContent: string): Promise<s
   const apiKey = process.env.GROQ_API_KEY;
   if (!apiKey) throw new Error('GROQ_API_KEY not set');
 
-  const res = await fetch('https://api.groq.com/openai/v1/chat/completions', {
-    method: 'POST',
-    headers: {
-      'content-type': 'application/json',
-      'authorization': `Bearer ${apiKey}`,
-    },
-    body: JSON.stringify({
-      model: 'llama-3.3-70b-versatile',
-      max_tokens: 1024,
-      messages: [
-        { role: 'system', content: systemPrompt },
-        { role: 'user', content: userContent },
-      ],
-    }),
+  const body = JSON.stringify({
+    model: 'llama-3.1-8b-instant',
+    max_tokens: 512,
+    messages: [
+      { role: 'system', content: systemPrompt },
+      { role: 'user', content: userContent },
+    ],
   });
 
-  if (!res.ok) {
-    const body = await res.text().catch(() => '');
-    throw new Error(`Groq API responded ${res.status}: ${body.slice(0, 200)}`);
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const res = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'authorization': `Bearer ${apiKey}`,
+      },
+      body,
+    });
+
+    if (res.status === 429 && attempt < 2) {
+      const delay = (attempt + 1) * 8_000;
+      console.warn(`[services-validation] Groq 429 rate limit — retry ${attempt + 1}/2 after ${delay}ms`);
+      await new Promise((r) => setTimeout(r, delay));
+      continue;
+    }
+
+    if (!res.ok) {
+      const errBody = await res.text().catch(() => '');
+      throw new Error(`Groq API responded ${res.status}: ${errBody.slice(0, 200)}`);
+    }
+
+    const data = await res.json() as { choices: Array<{ message: { content: string } }> };
+    return data.choices[0]?.message?.content ?? '';
   }
 
-  const data = await res.json() as { choices: Array<{ message: { content: string } }> };
-  return data.choices[0]?.message?.content ?? '';
+  throw new Error('Groq API: max retries exceeded after 429');
 }
 
 function parseResponse(raw: string): ValidatedServicesResult {
@@ -128,56 +118,75 @@ function parseResponse(raw: string): ValidatedServicesResult {
 
   const confidence = typeof parsed.confidence === 'number' ? parsed.confidence : 0;
 
-  if (confidence < CONFIDENCE_THRESHOLD) {
-    return { services: [], represented_brands: [], no_services_found: true, confidence };
-  }
-
-  const services = Array.isArray(parsed.services)
-    ? (parsed.services as unknown[])
-        .filter((s): s is string => typeof s === 'string' && s.trim().length > 0)
-        .map((s) => s.trim())
-    : [];
-
   const represented_brands = Array.isArray(parsed.represented_brands)
     ? (parsed.represented_brands as unknown[])
         .filter((b): b is string => typeof b === 'string' && b.trim().length > 0)
         .map((b) => b.trim())
     : [];
+  const primary_industry = typeof parsed.primary_industry === 'string' ? parsed.primary_industry.trim() : undefined;
+  const target_customers = typeof parsed.target_customers === 'string' ? parsed.target_customers.trim() : undefined;
+  const notes            = typeof parsed.notes === 'string' ? parsed.notes : undefined;
+
+  if (confidence < CONFIDENCE_THRESHOLD) {
+    return { services: [], represented_brands, primary_industry, target_customers, no_services_found: true, confidence, notes };
+  }
+
+  const services = Array.isArray(parsed.services)
+    ? [...new Set(
+        (parsed.services as unknown[])
+          .filter((s): s is string => typeof s === 'string' && s.trim().length > 0)
+          .map((s) => s.trim()),
+      )]
+    : [];
 
   return {
     services,
     represented_brands,
-    primary_industry: typeof parsed.primary_industry === 'string' ? parsed.primary_industry.trim() : undefined,
-    target_customers: typeof parsed.target_customers === 'string' ? parsed.target_customers.trim() : undefined,
+    primary_industry,
+    target_customers,
     no_services_found: Boolean(parsed.no_services_found) || services.length === 0,
     confidence,
-    notes: typeof parsed.notes === 'string' ? parsed.notes : undefined,
+    notes,
   };
 }
 
-// Picks the best page for services extraction: prefers services/about/products URLs,
-// falls back to the page with the most HTML content.
-export function selectServicesPage(pages: CrawledPage[]): CrawledPage | undefined {
-  const withHtml = pages.filter((p) => p.html && p.html.length > 100);
-  if (withHtml.length === 0) return undefined;
+export function selectServicesPages(pages: CrawledPage[]): CrawledPage[] {
+  const withText = pages.filter((p) => p.text && p.text.length > 50);
+  if (withText.length === 0) return [];
 
-  const servicesPage = withHtml.find((p) =>
-    /uslug|produk|deynost|deinost|services|products|about|za-nas|about-us/i.test(p.url),
-  );
-  if (servicesPage) return servicesPage;
+  const scored = withText.map((p) => {
+    let score = 0;
+    const url = p.url.toLowerCase();
 
-  return withHtml.slice().sort((a, b) => b.html.length - a.html.length)[0];
+    if (
+      /\/uslugi|\/uslug|\/services|\/service|\/deynost|\/dejnost|\/deinost|\/produkti|\/products|\/resheniya|\/resheniq|\/portfolio|\/katalog|\/proizvodstvo/i.test(url) ||
+      /\/услуг|\/продукт|\/дейност|\/решени|\/производств/i.test(url)
+    ) {
+      score += 100;
+    } else if (/\/about|\/za-nas|\/za-firmata|\/about-us|\/aboutus/i.test(url)) {
+      score += 50;
+    } else if (/^https?:\/\/[^/]+\/?$/.test(p.url)) {
+      score += 10;
+    }
+
+    score += Math.min(Math.floor(p.text.length / 100), 40);
+
+    return { page: p, score };
+  });
+
+  scored.sort((a, b) => b.score - a.score);
+  return scored.slice(0, 2).map((s) => s.page);
 }
 
 export async function validateServices(
   companyName: string,
   domain: string,
   pageUrl: string,
-  htmlContent: string,
+  pageText: string,
   callFn: CallFn = callGroqApi,
 ): Promise<ValidatedServicesResult> {
   const systemPrompt = buildSystemPrompt(companyName, domain, pageUrl);
-  const userContent = truncateHtml(htmlContent);
+  const userContent = truncateText(pageText);
 
   const raw = await callFn(systemPrompt, userContent);
   return parseResponse(raw);

@@ -1,0 +1,10 @@
+-- AlterTable: add hybrid discovery fields to DiscoveryCandidate (pipeline v2)
+ALTER TABLE "DiscoveryCandidate" ADD COLUMN IF NOT EXISTS "pageType"        TEXT;
+ALTER TABLE "DiscoveryCandidate" ADD COLUMN IF NOT EXISTS "extractedFrom"   TEXT;
+ALTER TABLE "DiscoveryCandidate" ADD COLUMN IF NOT EXISTS "discoverySource" TEXT;
+ALTER TABLE "DiscoveryCandidate" ADD COLUMN IF NOT EXISTS "confidence"      INTEGER;
+ALTER TABLE "DiscoveryCandidate" ADD COLUMN IF NOT EXISTS "orgName"         TEXT;
+ALTER TABLE "DiscoveryCandidate" ADD COLUMN IF NOT EXISTS "extractedEmail"  TEXT;
+ALTER TABLE "DiscoveryCandidate" ADD COLUMN IF NOT EXISTS "extractedPhone"  TEXT;
+ALTER TABLE "DiscoveryCandidate" ADD COLUMN IF NOT EXISTS "extractedAddress" TEXT;
+ALTER TABLE "DiscoveryCandidate" ADD COLUMN IF NOT EXISTS "rejectedReason"  TEXT;

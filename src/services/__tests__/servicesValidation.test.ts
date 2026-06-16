@@ -1,18 +1,18 @@
 /**
  * Tests for AI-assisted services/activities validation.
  *
- * validateServices() calls Claude API with the page HTML and returns:
- *   - services:          list of extracted service/product strings
+ * validateServices() receives already-extracted page text and returns:
+ *   - services:           list of extracted service/product strings
  *   - represented_brands: brands the company distributes/represents
- *   - primary_industry:  top-level industry label
- *   - target_customers:  who they sell to
+ *   - primary_industry:   top-level industry label
+ *   - target_customers:   who they sell to
  *
  * Tests inject a mock callFn to avoid real API calls.
  *
  * Run with:  npx ts-node src/services/__tests__/servicesValidation.test.ts
  */
 
-import { validateServices, selectServicesPage } from '../servicesValidation';
+import { validateServices, selectServicesPages } from '../servicesValidation';
 import type { CrawledPage } from '../../worker/crawl';
 
 let passed = 0;
@@ -55,52 +55,47 @@ function mockCall(responseJson: string) {
   return async (_system: string, _user: string): Promise<string> => responseJson;
 }
 
-const STUB_HTML = '<html><body>services page</body></html>';
+const STUB_TEXT = 'Предлагаме строителни услуги, ремонти и довършителни работи за жилищни и промишлени обекти.';
 
-const MIN_HTML = ' '.repeat(101);
-
-function makePage(url: string, html: string): CrawledPage {
-  const paddedHtml = html.length > 0 && html.length <= 100
-    ? html + MIN_HTML.slice(html.length)
-    : html;
-  return { url, text: '', html: paddedHtml, emails: [], phones: [], loginProtected: false, logoUrls: [] };
+function makePage(url: string, text: string): CrawledPage {
+  return { url, text, html: '', emails: [], phones: [], loginProtected: false, logoUrls: [] };
 }
 
-// ── selectServicesPage ────────────────────────────────────────────────────────
+// ── selectServicesPages ───────────────────────────────────────────────────────
 
-console.log('\nselectServicesPage');
+console.log('\nselectServicesPages');
 
 {
   const pages: CrawledPage[] = [
-    makePage('https://example.com/', '<html>home</html>'),
-    makePage('https://example.com/uslug', '<html>услуги page</html>'),
-    makePage('https://example.com/about', '<html>about</html>'),
+    makePage('https://example.com/', 'Начало на сайта, добре дошли на нашата страница с обща информация.'),
+    makePage('https://example.com/uslug', 'Предлагаме широк спектър от услуги за нашите клиенти в страната и чужбина.'),
+    makePage('https://example.com/about', 'За нас. Фирмата е основана през 2005 г. и работи в строителния бранш.'),
   ];
-  const page = selectServicesPage(pages);
-  assert('prefers services URL (uslug)', page?.url, 'https://example.com/uslug');
+  const result = selectServicesPages(pages);
+  assert('prefers services URL (uslug)', result[0]?.url, 'https://example.com/uslug');
 }
 
 {
   const pages: CrawledPage[] = [
-    makePage('https://example.com/', '<html>home</html>'),
-    makePage('https://example.com/products', '<html>products page</html>'),
+    makePage('https://example.com/', 'Начало на сайта, добре дошли на нашата страница с обща информация.'),
+    makePage('https://example.com/products', 'Продукти и стоки, предлагани от нашата фирма на конкурентни цени.'),
   ];
-  const page = selectServicesPage(pages);
-  assert('prefers products URL', page?.url, 'https://example.com/products');
+  const result = selectServicesPages(pages);
+  assert('prefers products URL', result[0]?.url, 'https://example.com/products');
 }
 
 {
   const pages: CrawledPage[] = [
     makePage('https://example.com/', 'a'.repeat(200)),
-    makePage('https://example.com/blog', 'b'.repeat(500)),
+    makePage('https://example.com/blog', 'b'.repeat(3000)),
   ];
-  const page = selectServicesPage(pages);
-  assert('falls back to largest HTML page', page?.url, 'https://example.com/blog');
+  const result = selectServicesPages(pages);
+  assert('falls back to page with most text when no URL match', result[0]?.url, 'https://example.com/blog');
 }
 
 {
-  const page = selectServicesPage([]);
-  assert('no pages → undefined', page, undefined);
+  const result = selectServicesPages([]);
+  assert('no pages → empty array', result.length, 0);
 }
 
 {
@@ -108,8 +103,20 @@ console.log('\nselectServicesPage');
     makePage('https://example.com/', ''),
     makePage('https://example.com/services', ''),
   ];
-  const page = selectServicesPage(pages);
-  assert('all empty html → undefined', page, undefined);
+  const result = selectServicesPages(pages);
+  assert('all empty text → empty array', result.length, 0);
+}
+
+{
+  const pages: CrawledPage[] = [
+    makePage('https://example.com/', 'Начало на сайта, добре дошли на нашата страница с обща информация.'),
+    makePage('https://example.com/services', 'Услуги: строителство, ремонт, довършване на обекти в страната и чужбина.'),
+    makePage('https://example.com/about', 'За нас. Фирмата е основана през 2005 г. и работи в строителния бранш.'),
+    makePage('https://example.com/blog', 'Блог статии и новини от строителния сектор за нашите читатели.'),
+  ];
+  const result = selectServicesPages(pages);
+  assert('returns at most 2 pages', result.length <= 2, true);
+  assert('top result is services URL', result[0]?.url, 'https://example.com/services');
 }
 
 // ── validateServices ─────────────────────────────────────────────────────────
@@ -123,7 +130,7 @@ async function runTests(): Promise<void> {
       'Стоун Строй',
       'stonstroy.com',
       'https://stonstroy.com/uslug',
-      STUB_HTML,
+      STUB_TEXT,
       mockCall(JSON.stringify({
         services: ['Строителство на жилищни сгради', 'Ремонтни дейности', 'Довършителни работи'],
         represented_brands: [],
@@ -141,25 +148,25 @@ async function runTests(): Promise<void> {
     assertGte('confidence ≥ 50', result.confidence, 50);
   }
 
-  console.log('\nvalidateServices — confidence below threshold (< 50) → empty result');
+  console.log('\nvalidateServices — confidence below threshold (< 35) → empty result');
 
   {
     const result = await validateServices(
       'Company',
       'company.bg',
       'https://company.bg/',
-      STUB_HTML,
+      STUB_TEXT,
       mockCall(JSON.stringify({
         services: ['Some service'],
         represented_brands: [],
         no_services_found: false,
-        confidence: 40,
+        confidence: 20,
       })),
     );
 
     assert('services empty (below threshold)', result.services.length, 0);
     assert('no_services_found true', result.no_services_found, true);
-    assert('confidence preserved', result.confidence, 40);
+    assert('confidence preserved', result.confidence, 20);
   }
 
   console.log('\nvalidateServices — represented_brands extracted for distributor');
@@ -169,7 +176,7 @@ async function runTests(): Promise<void> {
       'ТехноМакс',
       'technomax.bg',
       'https://technomax.bg/products',
-      STUB_HTML,
+      STUB_TEXT,
       mockCall(JSON.stringify({
         services: ['Продажба на климатична техника', 'Монтаж и сервиз'],
         represented_brands: ['Daikin', 'Mitsubishi Electric', 'LG'],
@@ -192,7 +199,7 @@ async function runTests(): Promise<void> {
       'Mystery Corp',
       'mystery.bg',
       'https://mystery.bg/',
-      STUB_HTML,
+      STUB_TEXT,
       mockCall(JSON.stringify({ services: [], represented_brands: [], no_services_found: true, confidence: 60 })),
     );
 
@@ -207,7 +214,7 @@ async function runTests(): Promise<void> {
       'Company',
       'company.bg',
       'https://company.bg/',
-      STUB_HTML,
+      STUB_TEXT,
       mockCall('Not valid JSON'),
     );
 
@@ -231,7 +238,7 @@ async function runTests(): Promise<void> {
       'WebAgency',
       'webagency.bg',
       'https://webagency.bg/services',
-      STUB_HTML,
+      STUB_TEXT,
       mockCall('```json\n' + inner + '\n```'),
     );
 
@@ -246,7 +253,7 @@ async function runTests(): Promise<void> {
       'Company',
       'company.bg',
       'https://company.bg/',
-      STUB_HTML,
+      STUB_TEXT,
       mockCall(JSON.stringify({
         services: ['Търговия с хранителни стоки'],
         represented_brands: [],
@@ -266,7 +273,7 @@ async function runTests(): Promise<void> {
       'Company',
       'company.bg',
       'https://company.bg/',
-      STUB_HTML,
+      STUB_TEXT,
       mockCall(JSON.stringify({
         services: ['Valid service', '', '  ', 'Another service'],
         represented_brands: ['', 'Real Brand'],

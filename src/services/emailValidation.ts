@@ -5,7 +5,6 @@ export interface ValidatedEmail {
   type: 'primary' | 'secondary' | 'personal';
   personal_domain: boolean;
   domain_match: boolean;
-  source_context: string;
   confidence: number;
 }
 
@@ -18,92 +17,68 @@ export interface EmailValidationResult {
 
 type CallFn = (systemPrompt: string, userContent: string) => Promise<string>;
 
-// Prompt template — htmlContent is passed as the user message, not inline here.
-const SYSTEM_PROMPT_TEMPLATE = `You are a data extraction specialist for a B2B lead generation system \
-that crawls Bulgarian company websites.
+const SYSTEM_PROMPT_TEMPLATE = `You are a B2B data assistant for Bulgarian companies.
 
-Your task is to extract ONLY real business contact email addresses from \
-the provided HTML content or text.
+Classify these already-extracted emails for {{companyName}} ({{domain}}).
 
-CONTEXT:
-- Company name: {{companyName}}
-- Company domain: {{domain}}
-- Page URL: {{pageUrl}}
+For each email set: type (primary/secondary/personal), personal_domain (true if abv.bg/gmail/yahoo etc), domain_match (true if matches {{domain}}).
 
-RULES - INCLUDE only emails that:
-1. Belong to the company's own domain (e.g. info@yotovstone.com)
-2. Are on a contact, about, or footer section
-3. Are clearly intended as business contact emails
-
-RULES - EXCLUDE:
-1. Emails from third-party domains unrelated to the company
-2. Example/placeholder emails (example@, test@, noreply@, no-reply@)
-3. Emails that appear in script tags, tracking pixels, or hidden elements
-4. Personal emails (gmail.com, abv.bg, yahoo.com) UNLESS no company \
-domain email exists — in that case flag them separately
-5. Emails found only in meta tags or structured data without visible \
-confirmation on the page
-6. Duplicate emails (return unique only)
-
-SPECIAL CASES for Bulgarian market:
-- abv.bg, mail.bg, dir.bg emails are common for small Bulgarian businesses \
-— include them but mark as "personal_domain": true
-- If the domain has a typo variant (e.g. yotovstones.com vs yotovstone.com) \
-flag it as "domain_mismatch": true
-
-OUTPUT FORMAT (JSON only, no explanation):
+OUTPUT (JSON only):
 {
   "emails": [
-    {
-      "email": "info@company.com",
-      "type": "primary|secondary|personal",
-      "personal_domain": false,
-      "domain_match": true,
-      "source_context": "short snippet of surrounding text where found",
-      "confidence": 0-100
-    }
+    { "email": "...", "type": "primary|secondary|personal", "personal_domain": false, "domain_match": true, "confidence": 0-100 }
   ],
-  "no_emails_found": false,
-  "notes": "optional: anything suspicious or worth flagging"
+  "no_emails_found": false
 }`;
 
-const HTML_TRUNCATE_CHARS = 50_000;
 const CONFIDENCE_THRESHOLD = 70;
 
-function buildSystemPrompt(companyName: string, domain: string, pageUrl: string): string {
+function buildSystemPrompt(companyName: string, domain: string): string {
   return SYSTEM_PROMPT_TEMPLATE
-    .replace('{{companyName}}', companyName)
-    .replace('{{domain}}', domain)
-    .replace('{{pageUrl}}', pageUrl);
+    .replace(/\{\{companyName\}\}/g, companyName)
+    .replace(/\{\{domain\}\}/g, domain);
 }
 
 async function callGroqApi(systemPrompt: string, userContent: string): Promise<string> {
   const apiKey = process.env.GROQ_API_KEY;
   if (!apiKey) throw new Error('GROQ_API_KEY not set');
 
-  const res = await fetch('https://api.groq.com/openai/v1/chat/completions', {
-    method: 'POST',
-    headers: {
-      'content-type': 'application/json',
-      'authorization': `Bearer ${apiKey}`,
-    },
-    body: JSON.stringify({
-      model: 'llama-3.3-70b-versatile',
-      max_tokens: 1024,
-      messages: [
-        { role: 'system', content: systemPrompt },
-        { role: 'user', content: userContent },
-      ],
-    }),
+  const body = JSON.stringify({
+    model: 'llama-3.1-8b-instant',
+    max_tokens: 256,
+    messages: [
+      { role: 'system', content: systemPrompt },
+      { role: 'user', content: userContent },
+    ],
   });
 
-  if (!res.ok) {
-    const body = await res.text().catch(() => '');
-    throw new Error(`Groq API responded ${res.status}: ${body.slice(0, 200)}`);
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const res = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'authorization': `Bearer ${apiKey}`,
+      },
+      body,
+    });
+
+    if (res.status === 429 && attempt < 2) {
+      const delay = (attempt + 1) * 8_000;
+      console.warn(`[email-validation] Groq 429 rate limit — retry ${attempt + 1}/2 after ${delay}ms`);
+      await new Promise((r) => setTimeout(r, delay));
+      continue;
+    }
+
+    if (!res.ok) {
+      const errBody = await res.text().catch(() => '');
+      throw new Error(`Groq API responded ${res.status}: ${errBody.slice(0, 200)}`);
+    }
+
+    const data = await res.json() as { choices: Array<{ message: { content: string } }> };
+    return data.choices[0]?.message?.content ?? '';
   }
 
-  const data = await res.json() as { choices: Array<{ message: { content: string } }> };
-  return data.choices[0]?.message?.content ?? '';
+  throw new Error('Groq API: max retries exceeded after 429');
 }
 
 function parseResponse(raw: string): EmailValidationResult {
@@ -140,7 +115,6 @@ function parseResponse(raw: string): EmailValidationResult {
         : 'secondary',
       personal_domain: Boolean(e.personal_domain),
       domain_match: e.domain_match !== false,
-      source_context: typeof e.source_context === 'string' ? e.source_context.slice(0, 200) : '',
       confidence: typeof e.confidence === 'number' ? e.confidence : 0,
     };
 
@@ -176,14 +150,11 @@ export function selectPageForValidation(pages: CrawledPage[]): CrawledPage | und
 export async function validateEmails(
   companyName: string,
   domain: string,
-  pageUrl: string,
-  htmlContent: string,
+  emails: string[],
   callFn: CallFn = callGroqApi,
 ): Promise<EmailValidationResult> {
-  const systemPrompt = buildSystemPrompt(companyName, domain, pageUrl);
-  const userContent = htmlContent.length > HTML_TRUNCATE_CHARS
-    ? htmlContent.slice(0, HTML_TRUNCATE_CHARS)
-    : htmlContent;
+  const systemPrompt = buildSystemPrompt(companyName, domain);
+  const userContent = `Emails found: ${emails.join(', ')}`;
 
   const raw = await callFn(systemPrompt, userContent);
   return parseResponse(raw);

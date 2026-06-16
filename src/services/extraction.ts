@@ -661,8 +661,8 @@ function extractLocation(pages: CrawledPage[]): string | undefined {
 
 // ── Services ──────────────────────────────────────────────────────────────────
 
-const SERVICE_HEADING_RE = /^(?:services?|what we (?:do|offer|provide|build)|our (?:services?|solutions?|work|expertise)|capabilities?|specializ\w+)$/i;
-const SERVICE_CONTEXT_RE = /service|solution|what we (do|offer|provide|build)|our work|expertise|capabilities|specializ/i;
+const SERVICE_HEADING_RE = /^(?:services?|what we (?:do|offer|provide|build)|our (?:services?|solutions?|work|expertise)|capabilities?|specializ\w+|услуги|нашите\s+услуги|какво\s+предлагаме|дейност|дейности|продукти|нашите\s+продукти|производство|решения|портфолио)$/i;
+const SERVICE_CONTEXT_RE = /service|solution|what we (do|offer|provide|build)|our work|expertise|capabilities|specializ|услуга|решение|специализира|предлага|произвежда|услуги|дейност|продукти|производство|портфолио/i;
 
 // Stop scanning when we hit the start of a clearly different section
 const STOP_SECTION_RE  = /^(?:about\s*us?|our\s*team|meet\s*(?:our|the)\s*team|contact\s*(?:us)?|clients?|partners?|testimonials?|blog|news|portfolio|pricing|home|get\s*in\s*touch|careers?)$/i;

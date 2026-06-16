@@ -6,10 +6,10 @@ import { extractProfile, isGenericAuthName } from '../services/extraction';
 import { enrichSocialLinks } from '../services/socialEnrichment';
 import { enrichAddress } from '../services/addressEnrichment';
 import { validateAddress } from '../services/addressValidation';
-import { validateEmails, selectPageForValidation } from '../services/emailValidation';
-import { validateServices, selectServicesPage } from '../services/servicesValidation';
+import { validateEmails } from '../services/emailValidation';
+import { validateServices, selectServicesPages } from '../services/servicesValidation';
 import { runLoginFallbackEnrichment } from '../services/loginFallbackEnrichment';
-import { discoverSites, SearchProviderError } from '../services/discovery';
+import { DiscoveryOrchestrator, SearchProviderError } from '../services/discovery/index';
 import { checkFreshness } from '../lib/freshness';
 import { generatePersonalizedContent } from '../services/personalization';
 import { generateCampaignEmail } from '../services/campaignEmailGeneration';
@@ -161,13 +161,11 @@ async function processSingleJob(job: PgBoss.JobWithMetadata<CrawlCompanyPayload>
     // lower-confidence candidates are logged but not stored.
     try {
       console.log(`[worker:email-validation] ${domain} GROQ_API_KEY=${!!process.env.GROQ_API_KEY}`);
-      const validationPage = selectPageForValidation(pages);
-      if (validationPage) {
+      if (profile.emails.length > 0) {
         const emailResult = await validateEmails(
           profile.name ?? domain,
           domain,
-          validationPage.url,
-          validationPage.html,
+          profile.emails,
         );
         if (emailResult.unverified.length > 0) {
           console.log(
@@ -189,34 +187,41 @@ async function processSingleJob(job: PgBoss.JobWithMetadata<CrawlCompanyPayload>
     }
 
     // 3f. Services validation — AI extraction of services, brands, industry, and target customers.
-    // Uses the services/about page when available. On success the profile services list is
-    // replaced; on no_services_found the pre-existing regex-extracted list is preserved as fallback.
+    // Tries top-ranked pages by URL signal + text length (up to 2). Stops as soon as one page
+    // yields services. On no_services_found the pre-existing regex-extracted list is preserved.
     let aiRepresentedBrands: string[] = [];
     let aiPrimaryIndustry: string | undefined;
     let aiTargetCustomers: string | undefined;
     try {
-      const svcPage = selectServicesPage(pages);
-      if (svcPage) {
+      const svcPages = selectServicesPages(pages);
+      if (svcPages.length === 0) {
+        console.log(`[worker:services-validation] ${domain} no pages with text — keeping extracted results`);
+      }
+      for (const svcPage of svcPages) {
+        console.log(
+          `[worker:services-validation] ${domain} trying page=${svcPage.url} text=${svcPage.text.length}chars`,
+        );
         const svcResult = await validateServices(
           profile.name ?? domain,
           domain,
           svcPage.url,
-          svcPage.html,
+          svcPage.text,
         );
+        if (!aiPrimaryIndustry)              aiPrimaryIndustry   = svcResult.primary_industry;
+        if (aiRepresentedBrands.length === 0) aiRepresentedBrands = svcResult.represented_brands;
+        if (!aiTargetCustomers)              aiTargetCustomers   = svcResult.target_customers;
+        if (svcResult.notes) console.log(`[worker:services-validation] ${domain} notes="${svcResult.notes}"`);
+
         if (svcResult.services.length > 0) {
           profile.services = svcResult.services;
           console.log(
-            `[worker:services-validation] ${domain} → ${svcResult.services.length} services (confidence=${svcResult.confidence})`,
+            `[worker:services-validation] ${domain} → ${svcResult.services.length} services from ${svcPage.url} (confidence=${svcResult.confidence})`,
           );
-        } else {
-          console.log(`[worker:services-validation] ${domain} no services found — keeping extracted results`);
+          break;
         }
-        aiRepresentedBrands = svcResult.represented_brands;
-        aiPrimaryIndustry   = svcResult.primary_industry;
-        aiTargetCustomers   = svcResult.target_customers;
-        if (svcResult.notes) {
-          console.log(`[worker:services-validation] ${domain} notes="${svcResult.notes}"`);
-        }
+        console.log(
+          `[worker:services-validation] ${domain} no services from ${svcPage.url} (confidence=${svcResult.confidence}, no_services_found=${svcResult.no_services_found})`,
+        );
       }
     } catch (e) {
       console.warn(`[worker:services-validation] ${domain} failed — keeping extracted results:`, e);
@@ -480,30 +485,67 @@ async function processDiscoverJob(
   const { batchId, tenantId, persona, location, keywords, maxResults, forceRecrawl, templateId } = job.data;
   console.log(`[worker/discover] starting discovery: "${persona}" in "${location}"`);
 
+  const limit = maxResults ?? 50;
+
   try {
-    const allSites = await discoverSites({ persona, location, keywords, maxResults });
+    // ── Run the full hybrid discovery pipeline ────────────────────────────────
+    const orchestrator = new DiscoveryOrchestrator();
+    const { accepted, rejected, allCandidates } = await orchestrator.discover({
+      persona,
+      location,
+      keywords,
+      maxResults,
+    });
 
-    // Cap to maxResults — quota was already checked against this limit at request time
-    const limit = maxResults ?? 50;
-    const keptSites = allSites.filter((s) => s.status === 'kept').slice(0, limit);
+    // ── Persist all candidates to DB (accepted + rejected) for UI transparency ─
+    if (allCandidates.length > 0) {
+      const acceptedUrls = new Set(accepted.map(c => c.sourceUrl));
 
-    // Persist all candidates (kept + filtered + blocked) for the UI
-    if (allSites.length > 0) {
-      await prisma.discoveryCandidate.createMany({
-        data: allSites.map((s) => ({
+      // Build a synthetic domain for extracted orgs that have no known website.
+      // These are stored in DiscoveryCandidate for UI/export but never enqueued for crawling.
+      const rows = allCandidates.map((c) => {
+        const domain =
+          c.domain ??
+          `extracted-${Buffer.from((c.name ?? c.sourceUrl).slice(0, 40)).toString('hex').slice(0, 16)}.local`;
+
+        const isAccepted = accepted.includes(c);
+        const wasBlocked  = c.pageType === 'IRRELEVANT' && !c.extractedFromUrl;
+        const status: 'KEPT' | 'FILTERED' | 'BLOCKED' = wasBlocked
+          ? 'BLOCKED'
+          : isAccepted
+            ? 'KEPT'
+            : 'FILTERED';
+
+        return {
           batchId,
-          domain: s.domain,
-          url: s.url,
-          title: s.title,
-          snippet: s.snippet,
-          status: s.status.toUpperCase() as 'KEPT' | 'FILTERED' | 'BLOCKED',
-        })),
-        skipDuplicates: true,
+          domain,
+          url:             c.websiteUrl ?? c.sourceUrl,
+          title:           c.name ?? c.title ?? null,
+          snippet:         c.snippet ?? null,
+          status,
+          pageType:        c.pageType,
+          extractedFrom:   c.extractedFromUrl ?? null,
+          discoverySource: c.sourceType,
+          confidence:      c.confidence,
+          orgName:         c.name ?? null,
+          extractedEmail:  c.email ?? null,
+          extractedPhone:  c.phone ?? null,
+          extractedAddress: c.address ?? null,
+          rejectedReason:  isAccepted ? null : (c.rejectedReason ?? null),
+        };
       });
+
+      await prisma.discoveryCandidate.createMany({ data: rows, skipDuplicates: true });
     }
 
-    if (keptSites.length === 0) {
-      console.log(`[worker/discover] no sites found for "${persona}" in "${location}"`);
+    // ── Cap accepted to quota limit ───────────────────────────────────────────
+    // Only candidates with a real (crawlable) domain count toward quota.
+    const crawlable = accepted
+      .filter(c => c.domain && !c.domain.endsWith('.local'))
+      .slice(0, limit);
+
+    if (crawlable.length === 0) {
+      console.log(`[worker/discover] no crawlable candidates for "${persona}" in "${location}"`);
       await prisma.crawlBatch.update({
         where: { id: batchId },
         data: { status: 'COMPLETED', totalCompanies: 0, completionPercentage: 100 },
@@ -511,27 +553,28 @@ async function processDiscoverJob(
       return;
     }
 
-    console.log(`[worker/discover] kept=${keptSites.length} total=${allSites.length}`);
+    console.log(
+      `[worker/discover] crawlable=${crawlable.length} accepted=${accepted.length} ` +
+      `rejected=${rejected.length} total=${allCandidates.length}`,
+    );
 
-    // Update batch with the count of sites to crawl (before dedup — will be corrected below)
     await prisma.crawlBatch.update({
       where: { id: batchId },
-      data: { totalCompanies: keptSites.length },
+      data: { totalCompanies: crawlable.length },
     });
 
     const crawlQueue = await getQueue();
     let jobsEnqueued = 0;
     let skippedFresh = 0;
 
-    for (const site of keptSites) {
-      const baseUrl = `https://${site.domain}`;
+    for (const candidate of crawlable) {
+      const domain  = candidate.domain!;
+      const baseUrl = `https://${domain}`;
 
-      // upsert returns existing record unchanged (update: {}) so lastCrawledAt is current
-      // include profile so freshness check can evaluate quality
       const company = await prisma.company.upsert({
-        where: { domain: site.domain },
-        create: { domain: site.domain, baseUrl, name: site.title },
-        update: {},
+        where:   { domain },
+        create:  { domain, baseUrl, name: candidate.name ?? candidate.title ?? null },
+        update:  {},
         include: { profile: true },
       });
 
@@ -543,33 +586,30 @@ async function processDiscoverJob(
       const freshness = checkFreshness(company, forceRecrawl ?? false);
 
       if (freshness.skip) {
-        console.log(`[discover] skipped fresh company ${site.domain} — ${freshness.reason}`);
+        console.log(`[discover] skipped fresh company ${domain} — ${freshness.reason}`);
         skippedFresh++;
         await updateBatchProgress(batchId);
       } else {
-        console.log(`[discover] recrawling ${site.domain} — ${freshness.reason}`);
+        console.log(`[discover] enqueued crawl for candidate ${domain} — ${freshness.reason}`);
         await enqueueCrawlJob(
-          { companyId: company.id, domain: site.domain, baseUrl, batchId, tenantId, templateId },
-          crawlQueue
+          { companyId: company.id, domain, baseUrl, batchId, tenantId, templateId },
+          crawlQueue,
         );
         jobsEnqueued++;
       }
     }
 
-    // Increment tenant weekly usage by accepted (not skipped) companies
     if (jobsEnqueued > 0) {
       await prisma.tenant.update({
         where: { id: tenantId },
-        data: { weeklyUsage: { increment: jobsEnqueued } },
+        data:  { weeklyUsage: { increment: jobsEnqueued } },
       });
     }
 
     console.log(`[worker/discover] enqueued=${jobsEnqueued} skippedFresh=${skippedFresh} for batch ${batchId}`);
   } catch (err) {
     if (err instanceof SearchProviderError) {
-      // Billing / quota / auth / rate-limit from Brave — fail this batch without retrying.
-      // Store the note inside searchQuery so the frontend can surface it without a schema change.
-      const errorNote = `Search provider quota/billing error. Brave Search returned HTTP ${err.statusCode}.`;
+      const errorNote = `Search provider quota/billing error. Returned HTTP ${err.statusCode}.`;
       console.error(
         `[worker/discover] provider error HTTP ${err.statusCode} for batch ${batchId} ` +
         `— query="${err.query}" — ${errorNote}`,
@@ -581,17 +621,17 @@ async function processDiscoverJob(
       const sq = (batchRecord?.searchQuery ?? {}) as Record<string, unknown>;
       await prisma.crawlBatch.update({
         where: { id: batchId },
-        data: { status: 'FAILED', searchQuery: { ...sq, _errorNote: errorNote } },
+        data:  { status: 'FAILED', searchQuery: { ...sq, _errorNote: errorNote } },
       });
-      return; // Do not re-throw — provider error is not retryable via pg-boss
+      return;
     }
 
     console.error('[worker/discover] failed:', err);
     await prisma.crawlBatch.update({
       where: { id: batchId },
-      data: { status: 'FAILED' },
+      data:  { status: 'FAILED' },
     });
-    throw err; // Other errors — let pg-boss retry
+    throw err;
   }
 }
 
