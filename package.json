@@ -14,7 +14,8 @@
     "db:push": "prisma db push",
     "db:studio": "prisma studio",
     "test": "jest",
-    "test:watch": "jest --watch"
+    "test:watch": "jest --watch",
+    "cleanup:raw-profiles": "ts-node --transpile-only src/scripts/cleanup-raw-profiles.ts"
   },
   "dependencies": {
     "@prisma/client": "^5.22.0",

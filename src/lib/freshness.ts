@@ -2,7 +2,9 @@
 // and will be re-crawled even if lastCrawledAt is within 30 days.
 export const COMPLETION_SCORE_THRESHOLD = 50;
 
-const THIRTY_DAYS_MS = 30 * 24 * 60 * 60 * 1000;
+// CompanyProfile validity window: AI-extracted data changes rarely.
+// A good, complete profile is considered fresh for 30 days.
+export const COMPANY_PROFILE_FRESHNESS_MS = 30 * 24 * 60 * 60 * 1000;
 
 export interface FreshnessProfile {
   completionScore: number;
@@ -29,7 +31,7 @@ export interface FreshnessResult {
  * Skip (reuse) only when ALL of the following hold:
  *   1. forceRecrawl is false
  *   2. crawlStatus is not FAILED / BLOCKED / PENDING
- *   3. lastCrawledAt is within 30 days
+ *   3. lastCrawledAt is within 30 days (COMPANY_PROFILE_FRESHNESS_MS)
  *   4. A CompanyProfile exists
  *   5. completionScore >= COMPLETION_SCORE_THRESHOLD
  *   6. Profile has at least one email OR phone
@@ -55,8 +57,8 @@ export function checkFreshness(
     return { skip: false, reason: 'never successfully crawled' };
   }
 
-  const thirtyDaysAgo = new Date(Date.now() - THIRTY_DAYS_MS);
-  if (company.lastCrawledAt <= thirtyDaysAgo) {
+  const freshnessThreshold = new Date(Date.now() - COMPANY_PROFILE_FRESHNESS_MS);
+  if (company.lastCrawledAt <= freshnessThreshold) {
     return { skip: false, reason: 'stale — last crawled >30 days ago' };
   }
 
@@ -85,6 +87,6 @@ export function checkFreshness(
 
   return {
     skip: true,
-    reason: `fresh good profile (score=${profile.completionScore}, crawled=${company.lastCrawledAt.toISOString()})`,
+    reason: `fresh profile — score=${profile.completionScore}, crawled=${company.lastCrawledAt.toISOString()} (<30 days ago)`,
   };
 }

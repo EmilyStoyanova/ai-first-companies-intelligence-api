@@ -1,5 +1,5 @@
 import type { SearchResult } from '../lib/search';
-import { rawSearch } from '../lib/search';
+import { cachedSearch } from '../lib/search';
 import type { ExtractedProfile } from './extraction';
 import { looksLikeTimeline, cleanAddressArtifacts } from './extraction';
 
@@ -167,7 +167,7 @@ export function parseAddressCandidates(
 export async function enrichAddress(
   profile: Pick<ExtractedProfile, 'location' | 'name'>,
   domain: string,
-  searchFn: (q: string) => Promise<SearchResult[]> = rawSearch,
+  searchFn: (q: string) => Promise<SearchResult[]> = cachedSearch,
 ): Promise<AddressEnrichmentResult> {
   // Clean map-widget artefacts (Distance:, pipe-duplicates) from the website
   // location so scoring and comparison work on the canonical address string.

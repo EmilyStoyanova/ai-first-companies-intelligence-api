@@ -5,7 +5,7 @@
 
 import { CrawledPage } from '../worker/crawl';
 import { runLogoOcr } from './logoOcr';
-import { rawSearch, SearchResult } from '../lib/search';
+import { cachedSearch, SearchResult } from '../lib/search';
 import { normalizeSocialUrl } from './extraction';
 
 export interface LoginFallbackResult {
@@ -32,7 +32,7 @@ async function discoverSocialProfiles(
   for (const platform of SOCIAL_PLATFORMS) {
     const label = platform === 'linkedin' ? 'LinkedIn company' : platform;
     try {
-      const results: SearchResult[] = await rawSearch(`"${name}" ${label}`);
+      const results: SearchResult[] = await cachedSearch(`"${name}" ${label}`);
       for (const r of results.slice(0, 5)) {
         if (found[platform]) break;
         const normalized = normalizeSocialUrl(r.url);
@@ -67,7 +67,7 @@ async function searchForDescription(name: string, domain: string): Promise<strin
 
   for (const query of queries) {
     try {
-      const results: SearchResult[] = await rawSearch(query);
+      const results: SearchResult[] = await cachedSearch(query);
       for (const r of results.slice(0, 3)) {
         if (!r.snippet || r.snippet.length < 30) continue;
         const snippetLower = r.snippet.toLowerCase();

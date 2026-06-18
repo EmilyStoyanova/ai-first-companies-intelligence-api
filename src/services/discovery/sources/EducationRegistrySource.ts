@@ -1,42 +1,17 @@
 import type { DiscoverySource, DiscoverySourceResult, PersonaSearchInput } from '../types';
 import { OrganizationExtractor } from '../OrganizationExtractor';
 import { PageClassifier } from '../PageClassifier';
+import { rawSearch } from '../../../lib/search';
 
 const EDUCATION_KEYWORDS = [
   'детски градини', 'детска градина', 'дг ', 'яслена', 'детски ясли', 'ясла',
   'училища', 'начално училище', 'основно училище', 'средно училище', 'гимназия',
 ];
 
-// Search API is invoked through node's global fetch so we only need the key
-function activeProvider(): 'brave' | 'serper' {
-  return process.env.SEARCH_PROVIDER?.toLowerCase() === 'serper' ? 'serper' : 'brave';
-}
-
 async function fetchSearchResults(query: string): Promise<Array<{ url: string; title?: string }>> {
-  const provider = activeProvider();
   try {
-    if (provider === 'serper') {
-      const key = process.env.SERPER_API_KEY;
-      if (!key) return [];
-      const res = await fetch('https://google.serper.dev/search', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', 'X-API-KEY': key },
-        body: JSON.stringify({ q: query, gl: 'bg', hl: 'bg', num: 5 }),
-      });
-      if (!res.ok) return [];
-      const data = await res.json() as { organic?: Array<{ link: string; title?: string }> };
-      return (data.organic ?? []).map(r => ({ url: r.link, title: r.title }));
-    } else {
-      const key = process.env.BRAVE_SEARCH_API_KEY;
-      if (!key) return [];
-      const url = `https://api.search.brave.com/res/v1/web/search?q=${encodeURIComponent(query)}&count=5&country=ALL&search_lang=bg`;
-      const res = await fetch(url, {
-        headers: { Accept: 'application/json', 'X-Subscription-Token': key },
-      });
-      if (!res.ok) return [];
-      const data = await res.json() as { web?: { results?: Array<{ url: string; title?: string }> } };
-      return (data.web?.results ?? []).map(r => ({ url: r.url, title: r.title }));
-    }
+    // Bulgarian-specific options: routes through Brave (primary) → Serper (fallback)
+    return await rawSearch(query, { country: 'bg', language: 'bg', num: 5 });
   } catch {
     return [];
   }

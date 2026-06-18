@@ -1,4 +1,6 @@
 import type { DiscoverySourceResult, PersonaSearchInput } from './types';
+import { isSocialPlatform } from '../../lib/isSocialPlatform';
+import { isEducationPersona, classifyEducationCandidate } from './educationQualification';
 
 const MIN_CONFIDENCE = 40;
 
@@ -24,9 +26,20 @@ function extractDomain(url: string): string | undefined {
 export class CandidateQualifier {
   qualify(
     candidate: DiscoverySourceResult,
-    _input: PersonaSearchInput,
+    input: PersonaSearchInput,
   ): { accepted: boolean; reason?: string } {
     const isExtracted = !!candidate.extractedFromUrl;
+
+    // Social platform domains must never become company domains — applies to all candidates
+    // regardless of whether they were extracted from a list page or found directly.
+    if (candidate.domain && isSocialPlatform(candidate.domain)) {
+      console.log(`[discovery] rejected candidate ${candidate.domain} reason=social_platform_domain`);
+      return { accepted: false, reason: 'social_platform_domain' };
+    }
+    if (candidate.websiteUrl && isSocialPlatform(candidate.websiteUrl)) {
+      console.log(`[discovery] rejected candidate ${candidate.websiteUrl} reason=social_platform_domain`);
+      return { accepted: false, reason: 'social_platform_domain' };
+    }
 
     // Always reject municipality/directory/news pages that are the top-level search result
     // (not orgs extracted FROM such pages)
@@ -71,6 +84,16 @@ export class CandidateQualifier {
 
     if (!hasSignal) {
       return { accepted: false, reason: 'no_contact_signal' };
+    }
+
+    // Education-specific qualification: stricter name-based rejection.
+    // Only applied when the candidate has a name to analyze — nameless candidates
+    // (domain-only) carry no textual signals and must not be penalized for it.
+    if (isEducationPersona(input.persona) && (candidate.name ?? candidate.title)) {
+      const edResult = classifyEducationCandidate(candidate);
+      if (!edResult.accepted) {
+        return { accepted: false, reason: edResult.reason };
+      }
     }
 
     return { accepted: true };

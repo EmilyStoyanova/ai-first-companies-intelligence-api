@@ -93,14 +93,18 @@ model CrawlBatch {
 }
 
 model RawCompanyProfile {
-  id          String   @id @default(uuid())
-  companyId   String
-  baseUrl     String
-  specificUrl String
-  data        Json
-  createdAt   DateTime @default(now())
+  id            String   @id @default(uuid())
+  companyId     String
+  baseUrl       String
+  specificUrl   String
+  normalizedUrl String
+  data          Json
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt @default(now())
 
   company Company @relation(fields: [companyId], references: [id])
+
+  @@unique([companyId, normalizedUrl])
 }
 
 model CompanyProfile {
@@ -207,4 +211,15 @@ model EmailTemplate {
 
   tenant  Tenant       @relation(fields: [tenantId], references: [id], onDelete: Cascade)
   batches CrawlBatch[]
+}
+
+model SearchCache {
+  id              String   @id @default(uuid())
+  normalizedQuery String   @unique
+  results         Json     @default("[]")
+  providerUsed    String?
+  lastSearchedAt  DateTime @default(now())
+  createdAt       DateTime @default(now())
+
+  @@index([lastSearchedAt])
 }

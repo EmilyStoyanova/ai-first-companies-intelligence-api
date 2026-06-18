@@ -203,6 +203,56 @@ describe('DiscoveryOrchestrator — scenario E: duplicate candidates', () => {
   });
 });
 
+describe('DiscoveryOrchestrator — scenario F (test H): education qualifier filters extracted non-schools', () => {
+  it('rejects registry/catalog rows extracted from municipality page; accepts real kindergartens', async () => {
+    // Municipality page listing real kindergartens alongside registry/catalog entries.
+    // The "bad" rows contain persona keyword "детски" so OrganizationExtractor picks them
+    // up via matchesPersonaKeyword — they must then be hard-rejected by the education qualifier.
+    const municipalityResult = makeResult({
+      sourceUrl: 'https://mezdra.bg/detski-gradini',
+      domain:    'mezdra.bg',
+      title:     'Детски градини | Община Мездра',
+      snippet:   'Списък на детските градини в Мездра',
+      pageType:  'MUNICIPALITY_PAGE',
+      confidence: 20,
+    });
+
+    const source = makeSource('SearchSource', [municipalityResult]);
+
+    mockFetch.mockResolvedValueOnce({
+      ok:   true,
+      text: jest.fn().mockResolvedValue(`
+        <html><body>
+          <h1>Детски градини в Община Мездра</h1>
+          <table>
+            <tr><th>Наименование</th><th>Телефон</th></tr>
+            <tr><td>ДГ Слънчице</td><td>0893111111</td></tr>
+            <tr><td>ДГ Надежда</td><td>0893222222</td></tr>
+            <tr><td>Регистър на детски градини в Мездра</td><td>0893333333</td></tr>
+            <tr><td>Каталог на детски градини Мездра</td><td>0893444444</td></tr>
+          </table>
+        </body></html>
+      `),
+    } as unknown as Response);
+
+    const orchestrator = new DiscoveryOrchestrator([source]);
+    const { accepted, rejected } = await orchestrator.discover(input);
+
+    // Municipality page itself must be rejected
+    expect(rejected.some(c => c.domain === 'mezdra.bg' && !c.extractedFromUrl)).toBe(true);
+
+    // Real kindergartens (ДГ prefix) should be accepted
+    const acceptedNames = accepted.map(c => c.name ?? '');
+    expect(acceptedNames.some(n => n.includes('Слънчице'))).toBe(true);
+    expect(acceptedNames.some(n => n.includes('Надежда'))).toBe(true);
+
+    // Registry/catalog rows must be rejected by the education qualifier
+    const rejectedNames = rejected.map(c => c.name ?? '');
+    expect(rejectedNames.some(n => n.includes('Регистър'))).toBe(true);
+    expect(rejectedNames.some(n => n.includes('Каталог'))).toBe(true);
+  });
+});
+
 describe('DiscoveryOrchestrator — source errors', () => {
   it('continues if one source fails (but propagates SearchProviderError)', async () => {
     const failingSource: DiscoverySource = {

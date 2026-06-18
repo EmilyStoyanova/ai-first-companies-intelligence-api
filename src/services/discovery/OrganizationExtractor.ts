@@ -1,5 +1,6 @@
 import * as cheerio from 'cheerio';
 import type { DiscoverySourceResult, PersonaSearchInput } from './types';
+import { isSocialPlatform } from '../../lib/isSocialPlatform';
 
 const EMAIL_RE = /[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}/;
 // Matches Bulgarian phones with optional spaces/dashes between digit groups
@@ -41,7 +42,7 @@ function findWebsiteLink($el: cheerio.Cheerio<any>, $: cheerio.CheerioAPI): stri
   const links = $el.find('a[href]');
   for (let i = 0; i < links.length; i++) {
     const href = $(links[i]).attr('href') ?? '';
-    if (href.startsWith('http') && !href.includes('facebook') && !href.includes('google')) {
+    if (href.startsWith('http') && !isSocialPlatform(href) && !href.includes('google')) {
       return href;
     }
   }
@@ -267,6 +268,9 @@ export class OrganizationExtractor {
 
       const domain = extractDomain(href);
       if (!domain) return;
+
+      // Never treat a social platform as a company website
+      if (isSocialPlatform(href)) return;
 
       // Skip if link goes back to the same municipality/source domain
       const sourceDomain = extractDomain(sourceUrl);

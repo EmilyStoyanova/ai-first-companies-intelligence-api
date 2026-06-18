@@ -63,8 +63,10 @@ describe('CandidateQualifier', () => {
     expect(reason).toBe('directory_or_portal');
   });
 
-  test('rejects SOCIAL_PAGE', () => {
-    const c = makeCandidate({ pageType: 'SOCIAL_PAGE', domain: 'facebook.com' });
+  test('rejects SOCIAL_PAGE (pageType-level rejection for non-listed social networks)', () => {
+    // vk.com is a social network not in the isSocialPlatform hardcoded list;
+    // rejection falls through to the pageType check instead.
+    const c = makeCandidate({ pageType: 'SOCIAL_PAGE', domain: 'vk.com' });
     const { accepted, reason } = qualifier.qualify(c, input);
     expect(accepted).toBe(false);
     expect(reason).toBe('social_page');
@@ -129,5 +131,60 @@ describe('CandidateQualifier', () => {
       extractedFromUrl: 'https://mezdra.bg/detski-gradini',
     });
     expect(qualifier.isAccepted(c, input)).toBe(true);
+  });
+
+  // ── Social platform tests ──────────────────────────────────────────────────
+
+  test('A — rejects facebook.com/company as company domain', () => {
+    const c = makeCandidate({ domain: 'facebook.com', websiteUrl: 'https://facebook.com/company', pageType: 'TARGET_ORGANIZATION' });
+    const { accepted, reason } = qualifier.qualify(c, input);
+    expect(accepted).toBe(false);
+    expect(reason).toBe('social_platform_domain');
+  });
+
+  test('B — rejects linkedin.com/company/openai as company domain', () => {
+    const c = makeCandidate({ domain: 'linkedin.com', websiteUrl: 'https://linkedin.com/company/openai', pageType: 'TARGET_ORGANIZATION' });
+    const { accepted, reason } = qualifier.qualify(c, input);
+    expect(accepted).toBe(false);
+    expect(reason).toBe('social_platform_domain');
+  });
+
+  test('C — rejects instagram.com/company as company domain', () => {
+    const c = makeCandidate({ domain: 'instagram.com', websiteUrl: 'https://instagram.com/company', pageType: 'TARGET_ORGANIZATION' });
+    const { accepted, reason } = qualifier.qualify(c, input);
+    expect(accepted).toBe(false);
+    expect(reason).toBe('social_platform_domain');
+  });
+
+  test('D — accepts company.com as valid company domain', () => {
+    const c = makeCandidate({ domain: 'company.com', websiteUrl: 'https://company.com', pageType: 'TARGET_ORGANIZATION' });
+    expect(qualifier.isAccepted(c, input)).toBe(true);
+  });
+
+  test('E — org with real website keeps company.com; facebook is not used as primary domain', () => {
+    // When an org has a real websiteUrl and a separate social link,
+    // only the real website would be set as domain — facebook is never domain here
+    const c = makeCandidate({
+      domain:     'company.com',
+      websiteUrl: 'https://company.com',
+      pageType:   'TARGET_ORGANIZATION',
+      confidence: 70,
+    });
+    const { accepted } = qualifier.qualify(c, input);
+    expect(accepted).toBe(true);
+    expect(c.domain).toBe('company.com');
+  });
+
+  test('F — rejects facebook.com even when extracted from a list page (bypasses isExtracted check)', () => {
+    const c = makeCandidate({
+      domain:          'facebook.com',
+      websiteUrl:      'https://facebook.com/su-ivan-vazov',
+      pageType:        'TARGET_ORGANIZATION',
+      confidence:      70,
+      extractedFromUrl: 'https://mezdra.bg/uchilishta',
+    });
+    const { accepted, reason } = qualifier.qualify(c, input);
+    expect(accepted).toBe(false);
+    expect(reason).toBe('social_platform_domain');
   });
 });

@@ -7,6 +7,7 @@ import fs from 'fs';
 import { prisma } from '../../lib/prisma';
 import { StorageService } from '../../services/storage';
 import { getQueue, enqueueCrawlJob } from '../../lib/queue';
+import { isNonCrawlablePlatform } from '../../services/nonCrawlablePlatforms';
 import { checkFreshness } from '../../lib/freshness';
 import { requireAuth, requireVerified } from '../../middleware/auth';
 import { ExportService } from '../../services/export';
@@ -263,6 +264,11 @@ router.post(
           data: [{ tenantId, companyId: company.id, sourceBatchId: batch.id }],
           skipDuplicates: true,
         });
+
+        if (isNonCrawlablePlatform(domain)) {
+          console.log(`[enqueue] skipped ${domain} reason=non_crawlable_platform`);
+          return false;
+        }
 
         const freshness = checkFreshness(company, forceRecrawl);
 
@@ -619,6 +625,12 @@ router.patch('/:id/candidates/:domain', requireAuth, async (req: Request, res: R
           where: { id: batchId },
           data: { totalCompanies: { increment: 1 } },
         });
+        if (isNonCrawlablePlatform(domain)) {
+          console.log(`[enqueue] skipped ${domain} reason=non_crawlable_platform`);
+          res.json({ ok: true, crawlTriggered: false, reason: 'non_crawlable_platform' });
+          return;
+        }
+
         const queue = await getQueue();
         await enqueueCrawlJob(
           { companyId: company.id, domain, baseUrl, batchId, tenantId },
@@ -699,6 +711,10 @@ router.post('/:id/re-enrich', requireAuth, requireVerified, async (req: Request,
     // that lives only in the upload route, not in the worker
     const queue = await getQueue();
     for (const company of companies) {
+      if (isNonCrawlablePlatform(company.domain)) {
+        console.log(`[enqueue] skipped ${company.domain} reason=non_crawlable_platform`);
+        continue;
+      }
       await enqueueCrawlJob(
         { companyId: company.id, domain: company.domain, baseUrl: company.baseUrl, batchId: id, tenantId, templateId: batch.templateId ?? undefined },
         queue,

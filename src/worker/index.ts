@@ -1,4 +1,7 @@
 import 'dotenv/config';
+import { isNonCrawlablePlatform, platformMetrics, NON_CRAWLABLE_PLATFORM_NOTE } from '../services/nonCrawlablePlatforms';
+import { normalizeRawProfileUrl } from '../lib/normalizeRawProfileUrl';
+import { rawProfileCacheDecision } from '../lib/rawProfileCache';
 import { getQueue, QUEUES, CrawlCompanyPayload, DiscoverPersonaPayload, PersonalizeCompanyPayload, enqueueCrawlJob, enqueuePersonalizeJob, stopQueue } from '../lib/queue';
 import { prisma } from '../lib/prisma';
 import { crawlCompany, detectBotProtection, BOT_CRAWL_NOTE } from './crawl';
@@ -26,6 +29,18 @@ async function processJob(jobs: PgBoss.JobWithMetadata<CrawlCompanyPayload>[]): 
 async function processSingleJob(job: PgBoss.JobWithMetadata<CrawlCompanyPayload>): Promise<void> {
   const { companyId, domain, baseUrl, batchId, tenantId, templateId } = job.data;
   console.log(`[worker] processing ${domain} (${companyId})`);
+
+  // Final safety guard — abort immediately if a non-crawlable platform somehow reached the worker.
+  if (isNonCrawlablePlatform(domain)) {
+    console.log(`[crawl] blocked ${domain} reason=non_crawlable_platform`);
+    platformMetrics.nonCrawlableRejected++;
+    await prisma.company.update({
+      where: { id: companyId },
+      data: { crawlStatus: 'BLOCKED', crawlNote: NON_CRAWLABLE_PLATFORM_NOTE },
+    });
+    await updateBatchProgress(batchId);
+    return;
+  }
 
   // Mark company as crawling
   await prisma.company.update({
@@ -60,16 +75,32 @@ async function processSingleJob(job: PgBoss.JobWithMetadata<CrawlCompanyPayload>
       return;
     }
 
-    // 2. Save raw data
-    await prisma.rawCompanyProfile.createMany({
-      data: pages.map((p) => ({
-        companyId,
-        baseUrl,
-        specificUrl: p.url,
-        data: { text: p.text, emails: p.emails, phones: p.phones },
-      })),
-      skipDuplicates: false,
-    });
+    // 2. Save raw data — upsert per page using (companyId, normalizedUrl) as the dedup key.
+    // Decision: skip (fresh <7d) | update (stale ≥7d) | create (new) — see lib/rawProfileCache.ts
+    for (const p of pages) {
+      const normalizedUrl = normalizeRawProfileUrl(p.url);
+      const pageData = { text: p.text, emails: p.emails, phones: p.phones };
+
+      const existing = await prisma.rawCompanyProfile.findUnique({
+        where: { companyId_normalizedUrl: { companyId, normalizedUrl } },
+        select: { id: true, updatedAt: true },
+      });
+
+      const action = rawProfileCacheDecision(existing);
+
+      if (action === 'skip') {
+        continue;
+      } else if (action === 'update') {
+        await prisma.rawCompanyProfile.update({
+          where: { id: existing!.id },
+          data: { specificUrl: p.url, data: pageData },
+        });
+      } else {
+        await prisma.rawCompanyProfile.create({
+          data: { companyId, baseUrl, specificUrl: p.url, normalizedUrl, data: pageData },
+        });
+      }
+    }
 
     // 3. Extract processed profile
     const profile = extractProfile(pages);
@@ -508,10 +539,17 @@ async function processDiscoverJob(
           c.domain ??
           `extracted-${Buffer.from((c.name ?? c.sourceUrl).slice(0, 40)).toString('hex').slice(0, 16)}.local`;
 
+        const isNcp      = !!c.domain && isNonCrawlablePlatform(c.domain);
         const isAccepted = accepted.includes(c);
         const wasBlocked  = c.pageType === 'IRRELEVANT' && !c.extractedFromUrl;
-        const status: 'KEPT' | 'FILTERED' | 'BLOCKED' = wasBlocked
-          ? 'BLOCKED'
+
+        if (isNcp) {
+          console.log(`[platform] detected ${domain}`);
+          platformMetrics.nonCrawlableRejected++;
+        }
+
+        const status: 'KEPT' | 'FILTERED' | 'BLOCKED' = (isNcp || wasBlocked)
+          ? (wasBlocked ? 'BLOCKED' : 'FILTERED')
           : isAccepted
             ? 'KEPT'
             : 'FILTERED';
@@ -531,7 +569,7 @@ async function processDiscoverJob(
           extractedEmail:  c.email ?? null,
           extractedPhone:  c.phone ?? null,
           extractedAddress: c.address ?? null,
-          rejectedReason:  isAccepted ? null : (c.rejectedReason ?? null),
+          rejectedReason:  isNcp ? 'NON_CRAWLABLE_PLATFORM' : isAccepted ? null : (c.rejectedReason ?? null),
         };
       });
 
@@ -541,7 +579,7 @@ async function processDiscoverJob(
     // ── Cap accepted to quota limit ───────────────────────────────────────────
     // Only candidates with a real (crawlable) domain count toward quota.
     const crawlable = accepted
-      .filter(c => c.domain && !c.domain.endsWith('.local'))
+      .filter(c => c.domain && !c.domain.endsWith('.local') && !isNonCrawlablePlatform(c.domain))
       .slice(0, limit);
 
     if (crawlable.length === 0) {
@@ -582,6 +620,14 @@ async function processDiscoverJob(
         data: [{ tenantId, companyId: company.id, sourceBatchId: batchId }],
         skipDuplicates: true,
       });
+
+      // Queue protection: non-crawlable platforms must never enter the crawl pipeline.
+      if (isNonCrawlablePlatform(domain)) {
+        console.log(`[enqueue] skipped ${domain} reason=non_crawlable_platform`);
+        platformMetrics.crawlJobsSkipped++;
+        await updateBatchProgress(batchId);
+        continue;
+      }
 
       const freshness = checkFreshness(company, forceRecrawl ?? false);
 

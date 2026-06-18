@@ -1,6 +1,7 @@
 import * as cheerio from 'cheerio';
 import { domainToUnicode } from 'url';
 import type { PageType, PersonaSearchInput } from './types';
+import { isSocialPlatform } from '../../lib/isSocialPlatform';
 
 // Bulgarian municipality URL path segments that indicate a government/municipality page
 const MUNICIPALITY_PATH_SEGMENTS = [
@@ -104,7 +105,7 @@ export class PageClassifier {
     const combined = `${title} ${snippet}`.toLowerCase();
 
     // ── Social media ────────────────────────────────────────────────────────
-    if (/^https?:\/\/(www\.)?(facebook|twitter|instagram|linkedin|youtube|tiktok)\.com/i.test(url)) {
+    if (isSocialPlatform(url)) {
       add('SOCIAL_PAGE', 100);
     }
 

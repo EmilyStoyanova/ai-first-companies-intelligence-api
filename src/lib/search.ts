@@ -1,46 +1,90 @@
-// Shared search provider abstraction used by social enrichment and login fallback enrichment.
-// Supports Brave Search (default) and Serper (Google) via SEARCH_PROVIDER env var.
+// Search abstraction used by enrichment and discovery flows.
+// All calls go through SearchProviderRouter: Brave (primary) → Serper (fallback).
+// Use cachedSearch() to avoid redundant API calls; rawSearch() bypasses the cache.
 
-export interface SearchResult {
-  url: string;
-  title?: string;
-  snippet?: string;
+import { prisma } from './prisma';
+import type { Prisma } from '@prisma/client';
+import { BraveSearchProvider } from './searchProviders/BraveSearchProvider';
+import { SerperSearchProvider } from './searchProviders/SerperSearchProvider';
+import { SearchProviderRouter } from './searchProviders/SearchProviderRouter';
+import type { SearchOptions } from './searchProviders/types';
+
+export type { SearchResult } from './searchProviders/types';
+
+const SEVEN_DAYS_MS = 7 * 24 * 60 * 60 * 1000;
+
+function normalizeQuery(query: string): string {
+  return query.trim().toLowerCase().replace(/\s+/g, ' ');
 }
 
-export async function rawSearch(query: string): Promise<SearchResult[]> {
-  const provider = process.env.SEARCH_PROVIDER?.toLowerCase() === 'serper' ? 'serper' : 'brave';
+function buildRouter(): SearchProviderRouter {
+  const primaryName = (
+    process.env.SEARCH_PRIMARY_PROVIDER ?? process.env.SEARCH_PROVIDER ?? 'brave'
+  ).toLowerCase();
 
-  if (provider === 'serper') {
-    const apiKey = process.env.SERPER_API_KEY;
-    if (!apiKey) return [];
-    const res = await fetch('https://google.serper.dev/search', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'X-API-KEY': apiKey },
-      body: JSON.stringify({ q: query, num: 5 }),
-      signal: AbortSignal.timeout(8_000),
+  const fallbackName = (process.env.SEARCH_FALLBACK_PROVIDER ?? 'serper').toLowerCase();
+
+  const providers = {
+    brave: () => new BraveSearchProvider(),
+    serper: () => new SerperSearchProvider(),
+  } as Record<string, () => BraveSearchProvider | SerperSearchProvider>;
+
+  const primary = (providers[primaryName] ?? providers['brave'])();
+  const fallback = primaryName !== fallbackName ? (providers[fallbackName] ?? providers['serper'])() : null;
+
+  return new SearchProviderRouter(primary, fallback);
+}
+
+/**
+ * Cache-aware search. Checks SearchCache before hitting any external provider.
+ * Freshness window: 7 days. On miss or stale, routes through Brave → Serper fallback.
+ */
+export async function cachedSearch(query: string, options?: SearchOptions): Promise<import('./searchProviders/types').SearchResult[]> {
+  const normalizedQuery = normalizeQuery(query);
+
+  try {
+    const cached = await prisma.searchCache.findUnique({ where: { normalizedQuery } });
+
+    if (cached) {
+      const ageMs = Date.now() - cached.lastSearchedAt.getTime();
+      const ageDays = Math.round(ageMs / (24 * 60 * 60 * 1000));
+
+      if (ageMs <= SEVEN_DAYS_MS) {
+        console.log(`[cache] hit query="${normalizedQuery}" age=${ageDays}d provider=${cached.providerUsed ?? 'unknown'}`);
+        return cached.results as unknown as import('./searchProviders/types').SearchResult[];
+      }
+
+      console.log(`[cache] stale query="${normalizedQuery}" age=${ageDays}d refreshing`);
+      const { results, providerUsed } = await buildRouter().search(query, options);
+      await prisma.searchCache.update({
+        where: { normalizedQuery },
+        data: {
+          results: results as unknown as Prisma.InputJsonValue,
+          lastSearchedAt: new Date(),
+          providerUsed,
+        },
+      });
+      console.log(`[cache] updated query="${normalizedQuery}" provider=${providerUsed}`);
+      return results;
+    }
+
+    console.log(`[cache] miss query="${normalizedQuery}"`);
+    const { results, providerUsed } = await buildRouter().search(query, options);
+    await prisma.searchCache.create({
+      data: {
+        normalizedQuery,
+        results: results as unknown as Prisma.InputJsonValue,
+        providerUsed,
+      },
     });
-    if (!res.ok) return [];
-    const data = await res.json() as {
-      organic?: Array<{ link: string; title?: string; snippet?: string }>;
-    };
-    return (data.organic ?? []).map((r) => ({ url: r.link, title: r.title, snippet: r.snippet }));
+    return results;
+  } catch (err) {
+    console.warn(`[cache] error, falling back to rawSearch: ${(err as Error).message}`);
+    return rawSearch(query, options);
   }
+}
 
-  // Default: Brave Search
-  const apiKey = process.env.BRAVE_SEARCH_API_KEY;
-  if (!apiKey) return [];
-  const url = `https://api.search.brave.com/res/v1/web/search?q=${encodeURIComponent(query)}&count=5`;
-  const res = await fetch(url, {
-    headers: { Accept: 'application/json', 'X-Subscription-Token': apiKey },
-    signal: AbortSignal.timeout(8_000),
-  });
-  if (!res.ok) return [];
-  const data = await res.json() as {
-    web?: { results?: Array<{ url: string; title?: string; description?: string }> };
-  };
-  return (data.web?.results ?? []).map((r) => ({
-    url: r.url,
-    title: r.title,
-    snippet: r.description,
-  }));
+export async function rawSearch(query: string, options?: SearchOptions): Promise<import('./searchProviders/types').SearchResult[]> {
+  const { results } = await buildRouter().search(query, options);
+  return results;
 }

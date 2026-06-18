@@ -1,6 +1,6 @@
 import { normalizeSocialUrl } from './extraction';
 import type { ExtractedProfile } from './extraction';
-import { rawSearch } from '../lib/search';
+import { cachedSearch } from '../lib/search';
 import type { SearchResult } from '../lib/search';
 
 // Enrich missing company social links using the configured search provider.
@@ -25,7 +25,7 @@ export async function enrichSocialLinks(
     try {
       const platformLabel = platform === 'linkedin' ? 'LinkedIn company' : 'Facebook';
       const query = `"${searchIdentifier}" ${platformLabel}`;
-      const results = await rawSearch(query);
+      const results = await cachedSearch(query);
 
       for (const result of results.slice(0, 5)) {
         const normalized = normalizeSocialUrl(result.url);
