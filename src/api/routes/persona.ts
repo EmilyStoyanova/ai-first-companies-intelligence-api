@@ -2,6 +2,7 @@ import { Router, Request, Response } from 'express';
 import { prisma } from '../../lib/prisma';
 import { getQueue, enqueueDiscoverJob } from '../../lib/queue';
 import { requireAuth, requireVerified } from '../../middleware/auth';
+import { buildDiscoveryKey } from '../../services/discovery/discoveryKey';
 
 const router = Router();
 
@@ -106,6 +107,7 @@ router.post('/', requireAuth, requireVerified, async (req: Request, res: Respons
     }
 
     const displayName = `${persona.trim()} – ${location.trim()}`;
+    const discoveryKey = buildDiscoveryKey(persona.trim(), location.trim(), keywords?.trim());
 
     const batch = await prisma.crawlBatch.create({
       data: {
@@ -118,6 +120,7 @@ router.post('/', requireAuth, requireVerified, async (req: Request, res: Respons
           keywords: keywords?.trim() ?? '',
           maxResults,
         },
+        discoveryKey,
         status: 'PROCESSING',
         totalCompanies: 0,
         ...(resolvedTemplateId ? { templateId: resolvedTemplateId } : {}),

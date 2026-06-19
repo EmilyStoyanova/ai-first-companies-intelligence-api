@@ -77,6 +77,7 @@ model CrawlBatch {
   fileName             String?
   sourceType           BatchSourceType @default(UPLOAD)
   searchQuery          Json?
+  discoveryKey         String?
   status               BatchStatus     @default(PENDING)
   totalCompanies       Int             @default(0)
   processedCompanies   Int             @default(0)
@@ -90,6 +91,9 @@ model CrawlBatch {
   template             EmailTemplate?       @relation(fields: [templateId], references: [id], onDelete: SetNull)
   tenantCompanies      TenantCompany[]
   discoveryCandidates  DiscoveryCandidate[]
+
+  @@index([discoveryKey])
+  @@index([sourceType, status, discoveryKey, updatedAt])
 }
 
 model RawCompanyProfile {

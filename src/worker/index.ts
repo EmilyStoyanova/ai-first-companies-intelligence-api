@@ -13,6 +13,8 @@ import { validateEmails } from '../services/emailValidation';
 import { validateServices, selectServicesPages } from '../services/servicesValidation';
 import { runLoginFallbackEnrichment } from '../services/loginFallbackEnrichment';
 import { DiscoveryOrchestrator, SearchProviderError } from '../services/discovery/index';
+import { buildDiscoveryKey } from '../services/discovery/discoveryKey';
+import { findCachedDiscovery, copyCandidatesToBatch } from '../services/discovery/discoveryCache';
 import { checkFreshness } from '../lib/freshness';
 import { generatePersonalizedContent } from '../services/personalization';
 import { generateCampaignEmail } from '../services/campaignEmailGeneration';
@@ -510,15 +512,130 @@ async function updateBatchProgress(batchId: string): Promise<void> {
   });
 }
 
+// ── Shared crawl enqueue helper ───────────────────────────────────────────────
+// Used by both the full discovery path and the cache-hit path.
+// Filters out .local synthetic domains and non-crawlable platforms, caps to
+// limit, upserts Company + TenantCompany, applies freshness check, and enqueues.
+
+type CrawlEntry = { domain: string; name?: string | null };
+
+async function enqueueCrawlsFromEntries(
+  entries: CrawlEntry[],
+  batchId: string,
+  tenantId: string,
+  limit: number,
+  forceRecrawl: boolean,
+  templateId: string | undefined,
+  crawlQueue: PgBoss,
+): Promise<void> {
+  const crawlable = entries
+    .filter(e => !e.domain.endsWith('.local') && !isNonCrawlablePlatform(e.domain))
+    .slice(0, limit);
+
+  if (crawlable.length === 0) {
+    await prisma.crawlBatch.update({
+      where: { id: batchId },
+      data:  { status: 'COMPLETED', totalCompanies: 0, completionPercentage: 100 },
+    });
+    return;
+  }
+
+  await prisma.crawlBatch.update({
+    where: { id: batchId },
+    data:  { totalCompanies: crawlable.length },
+  });
+
+  let jobsEnqueued = 0;
+  let skippedFresh = 0;
+
+  for (const entry of crawlable) {
+    const { domain, name } = entry;
+    const baseUrl = `https://${domain}`;
+
+    const company = await prisma.company.upsert({
+      where:   { domain },
+      create:  { domain, baseUrl, name: name ?? null },
+      update:  {},
+      include: { profile: true },
+    });
+
+    await prisma.tenantCompany.createMany({
+      data: [{ tenantId, companyId: company.id, sourceBatchId: batchId }],
+      skipDuplicates: true,
+    });
+
+    // Queue protection: non-crawlable platforms must never enter the crawl pipeline.
+    if (isNonCrawlablePlatform(domain)) {
+      console.log(`[enqueue] skipped ${domain} reason=non_crawlable_platform`);
+      platformMetrics.crawlJobsSkipped++;
+      await updateBatchProgress(batchId);
+      continue;
+    }
+
+    const freshness = checkFreshness(company, forceRecrawl);
+
+    if (freshness.skip) {
+      console.log(`[discover] skipped fresh company ${domain} — ${freshness.reason}`);
+      skippedFresh++;
+      await updateBatchProgress(batchId);
+    } else {
+      console.log(`[discover] enqueued crawl for candidate ${domain} — ${freshness.reason}`);
+      await enqueueCrawlJob(
+        { companyId: company.id, domain, baseUrl, batchId, tenantId, templateId },
+        crawlQueue,
+      );
+      jobsEnqueued++;
+    }
+  }
+
+  if (jobsEnqueued > 0) {
+    await prisma.tenant.update({
+      where: { id: tenantId },
+      data:  { weeklyUsage: { increment: jobsEnqueued } },
+    });
+  }
+
+  console.log(`[worker/discover] enqueued=${jobsEnqueued} skippedFresh=${skippedFresh} for batch ${batchId}`);
+}
+
 async function processDiscoverJob(
   job: PgBoss.JobWithMetadata<DiscoverPersonaPayload>
 ): Promise<void> {
   const { batchId, tenantId, persona, location, keywords, maxResults, forceRecrawl, templateId } = job.data;
   console.log(`[worker/discover] starting discovery: "${persona}" in "${location}"`);
 
-  const limit = maxResults ?? 50;
+  const limit      = maxResults ?? 50;
+  const crawlQueue = await getQueue();
 
   try {
+    // ── Discovery cache check ─────────────────────────────────────────────────
+    const discoveryKey = buildDiscoveryKey(persona, location, keywords);
+
+    if (forceRecrawl) {
+      console.log(`[discovery-cache] bypassed because force_recrawl=true`);
+    } else {
+      const cachedBatch = await findCachedDiscovery(batchId, discoveryKey);
+
+      if (cachedBatch) {
+        console.log(`[discovery-cache] key="${discoveryKey}" hit from batch=${cachedBatch.id}`);
+        const copied = await copyCandidatesToBatch(cachedBatch.id, batchId);
+        console.log(`[discovery-cache] copied ${copied} candidates to batch=${batchId}`);
+
+        const keptRows = await prisma.discoveryCandidate.findMany({
+          where:  { batchId, status: 'KEPT' },
+          select: { domain: true, orgName: true, title: true },
+        });
+
+        await enqueueCrawlsFromEntries(
+          keptRows.map(r => ({ domain: r.domain, name: r.orgName ?? r.title })),
+          batchId, tenantId, limit, forceRecrawl ?? false, templateId, crawlQueue,
+        );
+        return;
+      }
+
+      console.log(`[discovery-cache] miss key="${discoveryKey}"`);
+    }
+
     // ── Run the full hybrid discovery pipeline ────────────────────────────────
     const orchestrator = new DiscoveryOrchestrator();
     const { accepted, rejected, allCandidates } = await orchestrator.discover({
@@ -530,8 +647,6 @@ async function processDiscoverJob(
 
     // ── Persist all candidates to DB (accepted + rejected) for UI transparency ─
     if (allCandidates.length > 0) {
-      const acceptedUrls = new Set(accepted.map(c => c.sourceUrl));
-
       // Build a synthetic domain for extracted orgs that have no known website.
       // These are stored in DiscoveryCandidate for UI/export but never enqueued for crawling.
       const rows = allCandidates.map((c) => {
@@ -557,102 +672,38 @@ async function processDiscoverJob(
         return {
           batchId,
           domain,
-          url:             c.websiteUrl ?? c.sourceUrl,
-          title:           c.name ?? c.title ?? null,
-          snippet:         c.snippet ?? null,
+          url:              c.websiteUrl ?? c.sourceUrl,
+          title:            c.name ?? c.title ?? null,
+          snippet:          c.snippet ?? null,
           status,
-          pageType:        c.pageType,
-          extractedFrom:   c.extractedFromUrl ?? null,
-          discoverySource: c.sourceType,
-          confidence:      c.confidence,
-          orgName:         c.name ?? null,
-          extractedEmail:  c.email ?? null,
-          extractedPhone:  c.phone ?? null,
+          pageType:         c.pageType,
+          extractedFrom:    c.extractedFromUrl ?? null,
+          discoverySource:  c.sourceType,
+          confidence:       c.confidence,
+          orgName:          c.name ?? null,
+          extractedEmail:   c.email ?? null,
+          extractedPhone:   c.phone ?? null,
           extractedAddress: c.address ?? null,
-          rejectedReason:  isNcp ? 'NON_CRAWLABLE_PLATFORM' : isAccepted ? null : (c.rejectedReason ?? null),
+          rejectedReason:   isNcp ? 'NON_CRAWLABLE_PLATFORM' : isAccepted ? null : (c.rejectedReason ?? null),
         };
       });
 
       await prisma.discoveryCandidate.createMany({ data: rows, skipDuplicates: true });
     }
 
-    // ── Cap accepted to quota limit ───────────────────────────────────────────
-    // Only candidates with a real (crawlable) domain count toward quota.
-    const crawlable = accepted
-      .filter(c => c.domain && !c.domain.endsWith('.local') && !isNonCrawlablePlatform(c.domain))
-      .slice(0, limit);
-
-    if (crawlable.length === 0) {
-      console.log(`[worker/discover] no crawlable candidates for "${persona}" in "${location}"`);
-      await prisma.crawlBatch.update({
-        where: { id: batchId },
-        data: { status: 'COMPLETED', totalCompanies: 0, completionPercentage: 100 },
-      });
-      return;
-    }
+    const acceptedEntries: CrawlEntry[] = accepted
+      .filter(c => c.domain)
+      .map(c => ({ domain: c.domain!, name: c.name ?? c.title ?? null }));
 
     console.log(
-      `[worker/discover] crawlable=${crawlable.length} accepted=${accepted.length} ` +
-      `rejected=${rejected.length} total=${allCandidates.length}`,
+      `[worker/discover] accepted=${accepted.length} rejected=${rejected.length} ` +
+      `total=${allCandidates.length}`,
     );
 
-    await prisma.crawlBatch.update({
-      where: { id: batchId },
-      data: { totalCompanies: crawlable.length },
-    });
+    await enqueueCrawlsFromEntries(
+      acceptedEntries, batchId, tenantId, limit, forceRecrawl ?? false, templateId, crawlQueue,
+    );
 
-    const crawlQueue = await getQueue();
-    let jobsEnqueued = 0;
-    let skippedFresh = 0;
-
-    for (const candidate of crawlable) {
-      const domain  = candidate.domain!;
-      const baseUrl = `https://${domain}`;
-
-      const company = await prisma.company.upsert({
-        where:   { domain },
-        create:  { domain, baseUrl, name: candidate.name ?? candidate.title ?? null },
-        update:  {},
-        include: { profile: true },
-      });
-
-      await prisma.tenantCompany.createMany({
-        data: [{ tenantId, companyId: company.id, sourceBatchId: batchId }],
-        skipDuplicates: true,
-      });
-
-      // Queue protection: non-crawlable platforms must never enter the crawl pipeline.
-      if (isNonCrawlablePlatform(domain)) {
-        console.log(`[enqueue] skipped ${domain} reason=non_crawlable_platform`);
-        platformMetrics.crawlJobsSkipped++;
-        await updateBatchProgress(batchId);
-        continue;
-      }
-
-      const freshness = checkFreshness(company, forceRecrawl ?? false);
-
-      if (freshness.skip) {
-        console.log(`[discover] skipped fresh company ${domain} — ${freshness.reason}`);
-        skippedFresh++;
-        await updateBatchProgress(batchId);
-      } else {
-        console.log(`[discover] enqueued crawl for candidate ${domain} — ${freshness.reason}`);
-        await enqueueCrawlJob(
-          { companyId: company.id, domain, baseUrl, batchId, tenantId, templateId },
-          crawlQueue,
-        );
-        jobsEnqueued++;
-      }
-    }
-
-    if (jobsEnqueued > 0) {
-      await prisma.tenant.update({
-        where: { id: tenantId },
-        data:  { weeklyUsage: { increment: jobsEnqueued } },
-      });
-    }
-
-    console.log(`[worker/discover] enqueued=${jobsEnqueued} skippedFresh=${skippedFresh} for batch ${batchId}`);
   } catch (err) {
     if (err instanceof SearchProviderError) {
       const errorNote = `Search provider quota/billing error. Returned HTTP ${err.statusCode}.`;

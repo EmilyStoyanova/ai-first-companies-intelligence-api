@@ -225,7 +225,12 @@ async function fetchSerperQuery(apiKey: string, query: string): Promise<Discover
 // ── Provider dispatch ─────────────────────────────────────────────────────────
 
 function activeProvider(): 'brave' | 'serper' {
-  return process.env.SEARCH_PROVIDER?.toLowerCase() === 'serper' ? 'serper' : 'brave';
+  const v = (
+    process.env.SEARCH_PRIMARY_PROVIDER ??
+    process.env.SEARCH_PROVIDER ??
+    'brave'
+  ).toLowerCase();
+  return v === 'serper' ? 'serper' : 'brave';
 }
 
 async function fetchQuery(query: string): Promise<DiscoveredSite[]> {

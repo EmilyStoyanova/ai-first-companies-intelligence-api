@@ -1,5 +1,5 @@
 // Search abstraction used by enrichment and discovery flows.
-// All calls go through SearchProviderRouter: Brave (primary) → Serper (fallback).
+// Active provider: Serper (SEARCH_PRIMARY_PROVIDER=serper). No fallback until SearXNG is available on production server.
 // Use cachedSearch() to avoid redundant API calls; rawSearch() bypasses the cache.
 
 import { prisma } from './prisma';
