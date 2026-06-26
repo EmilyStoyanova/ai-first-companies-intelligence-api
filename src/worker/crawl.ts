@@ -179,7 +179,7 @@ export function buildUrlQueue(homepageHtml: string, baseUrl: string): UrlQueueRe
 }
 
 function makeConfig(): Configuration {
-  return new Configuration({ storageClient: new MemoryStorage() });
+  return new Configuration({ storageClient: new MemoryStorage({ persistStorage: false }) });
 }
 
 // Strip <script>, <style>, and <noscript> before extracting visible text so
@@ -492,7 +492,7 @@ async function fetchForBotCheck(url: string): Promise<CrawledPage | null> {
   }
 }
 
-const CRAWL_TIMEOUT_MS = 60_000;
+const CRAWL_TIMEOUT_MS = 120_000;
 
 export async function crawlCompany(baseUrl: string): Promise<CrawledPage[]> {
   const crawl = async (): Promise<CrawledPage[]> => {
