@@ -14,6 +14,7 @@ import personaRouter from './routes/persona';
 import tenantRouter from './routes/tenant';
 import templatesRouter from './routes/templates';
 import { logBrevoConfig } from '../lib/email';
+import { startWorker } from '../worker';
 
 // ── Startup environment validation ────────────────────────────────────────────
 // Fail fast before binding to port so misconfigured deployments are obvious.
@@ -61,6 +62,12 @@ app.listen(PORT, () => {
   console.log(`[server] Frontend  → http://localhost:3000`);
   console.log(`[server] API docs  → http://localhost:${PORT}/docs`);
   logBrevoConfig();
+
+  if (process.env.ENABLE_EMBEDDED_WORKER === 'true') {
+    startWorker().catch((err) => {
+      console.error('[server] embedded worker failed to start:', err);
+    });
+  }
 });
 
 export default app;
