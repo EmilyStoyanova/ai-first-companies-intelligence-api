@@ -512,12 +512,18 @@ export async function crawlCompany(baseUrl: string): Promise<CrawledPage[]> {
     return pages;
   };
 
-  const timeout = new Promise<CrawledPage[]>((resolve) =>
-    setTimeout(() => {
+  let timeoutId: ReturnType<typeof setTimeout> | undefined;
+
+  const timeout = new Promise<CrawledPage[]>((resolve) => {
+    timeoutId = setTimeout(() => {
       console.warn(`[crawl] timeout after ${CRAWL_TIMEOUT_MS / 1000}s for ${baseUrl}`);
       resolve([]);
-    }, CRAWL_TIMEOUT_MS)
-  );
+    }, CRAWL_TIMEOUT_MS);
+  });
 
-  return Promise.race([crawl(), timeout]);
+  try {
+    return await Promise.race([crawl(), timeout]);
+  } finally {
+    clearTimeout(timeoutId);
+  }
 }
