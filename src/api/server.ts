@@ -13,7 +13,7 @@ import exportsRouter from './routes/exports';
 import personaRouter from './routes/persona';
 import tenantRouter from './routes/tenant';
 import templatesRouter from './routes/templates';
-import { logSmtpConfig } from '../lib/email';
+import { logBrevoConfig } from '../lib/email';
 
 // ── Startup environment validation ────────────────────────────────────────────
 // Fail fast before binding to port so misconfigured deployments are obvious.
@@ -60,7 +60,7 @@ app.listen(PORT, () => {
   console.log(`[server] listening on http://localhost:${PORT}`);
   console.log(`[server] Frontend  → http://localhost:3000`);
   console.log(`[server] API docs  → http://localhost:${PORT}/docs`);
-  logSmtpConfig();
+  logBrevoConfig();
 });
 
 export default app;
