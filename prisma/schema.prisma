@@ -37,8 +37,28 @@ model User {
   emailVerificationToken String?  @unique
   createdAt              DateTime @default(now())
 
-  tenant       Tenant             @relation(fields: [tenantId], references: [id])
-  monthlyUsage UserMonthlyUsage[]
+  tenant          Tenant             @relation(fields: [tenantId], references: [id])
+  monthlyUsage    UserMonthlyUsage[]
+  adminAuditLogs  AuditLog[]         @relation("AdminAuditLogs")
+  targetAuditLogs AuditLog[]         @relation("TargetAuditLogs")
+}
+
+model AuditLog {
+  id           String   @id @default(uuid())
+  adminUserId  String
+  targetUserId String
+  action       String
+  field        String?
+  oldValue     String?
+  newValue     String?
+  createdAt    DateTime @default(now())
+
+  adminUser  User @relation("AdminAuditLogs", fields: [adminUserId], references: [id])
+  targetUser User @relation("TargetAuditLogs", fields: [targetUserId], references: [id])
+
+  @@index([adminUserId])
+  @@index([targetUserId])
+  @@index([createdAt])
 }
 
 model UserMonthlyUsage {
