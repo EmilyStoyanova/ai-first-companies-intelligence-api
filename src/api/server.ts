@@ -7,6 +7,7 @@ import swaggerUi from 'swagger-ui-express';
 import { swaggerSpec } from '../lib/swagger';
 
 import authRouter from './routes/auth';
+import adminRouter from './routes/admin';
 import batchesRouter from './routes/batches';
 import companiesRouter from './routes/companies';
 import exportsRouter from './routes/exports';
@@ -46,6 +47,7 @@ app.use('/docs', swaggerUi.serve, swaggerUi.setup(swaggerSpec));
 app.get('/docs.json', (_req, res) => res.json(swaggerSpec));
 
 app.use('/api/auth', authRouter);
+app.use('/api/admin', adminRouter);
 app.use('/api/batches', batchesRouter);
 app.use('/api/companies', companiesRouter);
 app.use('/api/exports', exportsRouter);
